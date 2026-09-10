@@ -198,6 +198,58 @@ def load_plan_compare(groups: tuple) -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=600)
+def load_on_track(level: str) -> pd.DataFrame:
+    table = "looker_on_track_category" if level == "category" else "looker_on_track"
+    key = "category" if level == "category" else "group_key"
+    return run(
+        f"""
+        SELECT {key} AS name, on_hand, on_order, available,
+               forecast_demand, sold_season_to_date,
+               proj_leftover, leftover_ratio, cover_months, status, status_rank
+        FROM `{DS}.{table}`
+        ORDER BY status_rank, ABS(proj_leftover) DESC
+        """
+    )
+
+
+@st.cache_data(ttl=600)
+def load_needs_plan() -> pd.DataFrame:
+    return run(
+        f"""
+        SELECT group_key, color, size, product_key, order_us, name, reason
+        FROM `{DS}.new_needs_plan`
+        ORDER BY order_us DESC NULLS LAST
+        """
+    )
+
+
+@st.cache_data(ttl=600)
+def load_oos(groups: tuple, categories: tuple) -> pd.DataFrame:
+    where = ["kind = 'actual'"]
+    params: list = []
+    if groups:
+        where.append("group_key IN UNNEST(@groups)")
+        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+    if categories:
+        where.append("category IN UNNEST(@cats)")
+        params.append(bigquery.ArrayQueryParameter("cats", "STRING", list(categories)))
+    return run(
+        f"""
+        SELECT month,
+               SUM(sales_units)  AS sales,
+               SUM(demand_units) AS demand,
+               SAFE_DIVIDE(SUM(oos_days * IFNULL(sales_units,0)),
+                           NULLIF(SUM(IFNULL(sales_units,0)),0)) AS oos_weighted
+        FROM `{DS}.looker_fact_monthly`
+        WHERE {' AND '.join(where)}
+        GROUP BY month
+        ORDER BY month
+        """,
+        params,
+    )
+
+
 def save_overrides(rows: pd.DataFrame, author: str, note: str) -> int:
     payload = pd.DataFrame(
         {
@@ -252,11 +304,21 @@ with st.sidebar:
 g, c = tuple(grps), tuple(cats)
 
 st.title("Sales Planner")
-scope = "все группы" if not grps and not cats else ", ".join(cats + grps)
+if not grps and not cats:
+    scope = "все группы"
+else:
+    parts = []
+    if cats:
+        parts.append(", ".join(cats) if len(cats) <= 2 else f"{len(cats)} категорий")
+    if grps:
+        parts.append(", ".join(grps) if len(grps) <= 2 else f"{len(grps)} групп")
+    scope = " · ".join(parts)
 st.caption(f"Данные BigQuery · {scope}")
 
-tab_over, tab_dims, tab_edit, tab_cmp, tab_hist = st.tabs(
-    ["Обзор", "Разрезы", "Ввод плана", "План и факт", "Правки"]
+(tab_over, tab_track, tab_needs, tab_dims,
+ tab_edit, tab_cmp, tab_hist) = st.tabs(
+    ["Обзор", "Сезон", "Требует плана", "Разрезы",
+     "Ввод плана", "План и факт", "Правки"]
 )
 
 # ------------------------------------------------------------------ обзор
@@ -304,6 +366,102 @@ with tab_over:
         st.plotly_chart(fig, use_container_width=True)
         st.caption("Линия факта обрывается на последнем закрытом месяце. Дальше — модель.")
 
+        st.markdown("**Продажи и упущенный спрос**")
+        st.caption(
+            "Разрыв между спросом и продажами — то, что не купили из-за отсутствия "
+            "товара. Столбцы показывают средние дни без остатка."
+        )
+        o = load_oos(g, c)
+        if not o.empty:
+            o["month"] = pd.to_datetime(o["month"])
+            o["lost"] = (o["demand"] - o["sales"]).clip(lower=0)
+            f2 = go.Figure()
+            f2.add_trace(go.Bar(
+                x=o["month"], y=o["oos_weighted"], name="дней без остатка",
+                marker_color="#E4DFD6", yaxis="y2",
+                hovertemplate="%{y:.1f} дн<extra></extra>"))
+            f2.add_trace(go.Scatter(
+                x=o["month"], y=o["sales"], mode="lines", name="продано",
+                line=dict(color=FACT, width=2.5)))
+            f2.add_trace(go.Scatter(
+                x=o["month"], y=o["demand"], mode="lines", name="спрос с поправкой",
+                line=dict(color=FCST, width=2, dash="dot")))
+            f2.update_layout(
+                height=300, margin=dict(l=0, r=0, t=10, b=0),
+                plot_bgcolor="white", paper_bgcolor="white", hovermode="x unified",
+                font=dict(color=INK, size=12), barmode="overlay",
+                legend=dict(orientation="h", y=1.12, x=0),
+                xaxis=dict(showgrid=False, linecolor="#DDE3E8"),
+                yaxis=dict(gridcolor="#EEF1F4", zeroline=False, title="единиц"),
+                yaxis2=dict(overlaying="y", side="right", showgrid=False,
+                            title="дней", range=[0, 31]),
+            )
+            st.plotly_chart(f2, use_container_width=True)
+            lost = o["lost"].sum()
+            if lost > 0:
+                st.caption(
+                    f"Всего упущено за период: {lost:,.0f} ед.".replace(",", " ")
+                )
+
+# ------------------------------------------------------------------ сезон
+with tab_track:
+    level = st.radio("Уровень", ["Категории", "Группы"], horizontal=True,
+                     label_visibility="collapsed")
+    tr = load_on_track("category" if level == "Категории" else "group")
+
+    if tr.empty:
+        st.info("Оценка по сезону пока не собрана.")
+    else:
+        red = int((tr["status_rank"] == 1).sum())
+        amber = int((tr["status_rank"] == 2).sum())
+        green = int((tr["status_rank"] == 3).sum())
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Требуют решения", red)
+        m2.metric("Под наблюдением", amber)
+        m3.metric("В норме", green)
+        m4.metric("Спрос до конца сезона",
+                  f"{tr['forecast_demand'].sum():,.0f}".replace(",", " "))
+
+        st.caption(
+            "Хватит ли товара до конца сезона: на руках плюс в пути минус "
+            "прогноз спроса. Красное — решать сейчас."
+        )
+
+        show = tr.rename(columns={
+            "name": "Позиция", "on_hand": "На руках", "on_order": "В пути",
+            "available": "Доступно", "forecast_demand": "Спрос до конца сезона",
+            "sold_season_to_date": "Продано в сезоне",
+            "proj_leftover": "Останется", "cover_months": "Покрытие, мес",
+            "status": "Статус",
+        }).drop(columns=["leftover_ratio", "status_rank"])
+
+        st.dataframe(
+            show, hide_index=True, use_container_width=True, height=520,
+            column_config={
+                "Останется": st.column_config.NumberColumn(
+                    help="Минус — не хватит товара, плюс — останется на складе"),
+                "Покрытие, мес": st.column_config.NumberColumn(format="%.1f"),
+            },
+        )
+
+# ------------------------------------------------------------------ требует плана
+with tab_needs:
+    needs = load_needs_plan()
+    if needs.empty:
+        st.success("Все позиции получили прогноз. Ручное планирование не требуется.")
+    else:
+        st.metric("Позиций без прогноза", len(needs))
+        st.caption(
+            "Модели не на чем учиться: новая линейка без истории продаж или "
+            "не проставлен Order US. План по ним ставится руками."
+        )
+        show = needs.rename(columns={
+            "group_key": "Группа", "color": "Цвет", "size": "Размер",
+            "product_key": "Ключ", "order_us": "Order US",
+            "name": "Наименование", "reason": "Почему",
+        })
+        st.dataframe(show, hide_index=True, use_container_width=True, height=520)
+
 # ------------------------------------------------------------------ разрезы
 with tab_dims:
     st.caption("Прогноз на весь горизонт, по измерениям")
@@ -336,7 +494,12 @@ with tab_dims:
 # ------------------------------------------------------------------ ввод
 with tab_edit:
     if not grps:
-        st.info("Выберите группы в фильтрах слева — иначе сетка будет слишком большой.")
+        st.info("Выберите группы в фильтрах слева, чтобы начать. Удобнее по одной категории за раз.")
+    elif len(grps) > 8:
+        st.warning(
+            f"Выбрано {len(grps)} групп — в такой сетке неудобно работать. "
+            "Оставьте до восьми: план ставят по одной категории за раз."
+        )
     else:
         df = load_plan(months_ahead, g)
         if df.empty:
