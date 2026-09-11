@@ -76,6 +76,13 @@ def run(sql: str, params: list | None = None) -> pd.DataFrame:
 
 # ------------------------------------------------------------------ данные
 @st.cache_data(ttl=600)
+def load_planned_groups() -> set:
+    """Группы, для которых модель выдала план. Только их можно редактировать."""
+    df = run(f"SELECT DISTINCT group_key FROM `{DS}.plan_sales`")
+    return set(df["group_key"].dropna())
+
+
+@st.cache_data(ttl=600)
 def load_dims() -> pd.DataFrame:
     return run(
         f"""
@@ -493,15 +500,32 @@ with tab_dims:
 
 # ------------------------------------------------------------------ ввод
 with tab_edit:
-    if not grps:
-        st.info("Выберите группы в фильтрах слева, чтобы начать. Удобнее по одной категории за раз.")
-    elif len(grps) > 8:
+    planned = load_planned_groups()
+    editable = [x for x in grps if x in planned]
+    skipped = [x for x in grps if x not in planned]
+
+    if skipped:
+        st.caption(
+            "Без плана: " + ", ".join(skipped) +
+            " — модель не дала прогноз (нет истории продаж или не проставлен "
+            "Order US). Такие позиции смотрите во вкладке «Требует плана»."
+        )
+
+    if not editable:
+        if grps:
+            st.info(
+                "У выбранных групп плана нет. Выберите другие — редактировать "
+                f"можно {len(planned)} групп из {len(set(dims['group_key'].dropna()))}."
+            )
+        else:
+            st.info("Выберите группы в фильтрах слева. Удобнее по одной категории за раз.")
+    elif len(editable) > 8:
         st.warning(
-            f"Выбрано {len(grps)} групп — в такой сетке неудобно работать. "
+            f"Выбрано {len(editable)} групп — в такой сетке неудобно работать. "
             "Оставьте до восьми: план ставят по одной категории за раз."
         )
     else:
-        df = load_plan(months_ahead, g)
+        df = load_plan(months_ahead, tuple(editable))
         if df.empty:
             st.info("На этот горизонт плана нет.")
         else:
