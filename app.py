@@ -16,6 +16,7 @@ Sales Planner — план продаж и аналитика поверх BigQu
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -64,6 +65,62 @@ def get_client() -> bigquery.Client:
 
 
 client = get_client()
+
+
+# ------------------------------------------------------------------ вход
+def check_auth() -> str:
+    """Один общий логин на всю команду. Вход держится, пока открыта вкладка;
+    с галочкой «запомнить» — 30 дней, токен уезжает в адрес страницы."""
+    users = st.secrets.get("auth", {})
+    if not users:
+        return "guest"          # пароль не настроен — пускаем всех
+
+    secret = str(users)
+
+    def make_token(login: str) -> str:
+        raw = f"{login}|{secret}|{dt.date.today().isoformat()}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+    def token_valid(login: str, token: str) -> bool:
+        for back in range(31):                      # токен живёт 30 дней
+            day = (dt.date.today() - dt.timedelta(days=back)).isoformat()
+            raw = f"{login}|{secret}|{day}"
+            if hashlib.sha256(raw.encode()).hexdigest()[:32] == token:
+                return True
+        return False
+
+    # уже вошли в этой сессии
+    if st.session_state.get("user"):
+        return st.session_state["user"]
+
+    # пришли по ссылке с токеном
+    qp = st.query_params
+    if qp.get("u") and qp.get("t") and token_valid(qp["u"], qp["t"]):
+        st.session_state["user"] = qp["u"]
+        return qp["u"]
+
+    # форма входа
+    st.title("Sales Planner")
+    with st.form("login"):
+        login = st.text_input("Логин")
+        pwd = st.text_input("Пароль", type="password")
+        remember = st.checkbox("Запомнить на 30 дней", value=True)
+        ok = st.form_submit_button("Войти", type="primary")
+
+    if ok:
+        if users.get(login) == pwd:
+            st.session_state["user"] = login
+            if remember:
+                st.query_params["u"] = login
+                st.query_params["t"] = make_token(login)
+            st.rerun()
+        else:
+            st.error("Неверный логин или пароль")
+
+    st.stop()
+
+
+author = check_auth()
 
 
 def run(sql: str, params: list | None = None) -> pd.DataFrame:
@@ -306,7 +363,12 @@ with st.sidebar:
     grps = st.multiselect("Группа", sorted(pool["group_key"].dropna().unique()))
     st.markdown("---")
     months_ahead = st.slider("Горизонт плана, месяцев", 3, 18, 12)
-    author = st.text_input("Ваш email", placeholder="name@maximumstores.online")
+    st.markdown("---")
+    st.caption(f"Вы вошли как **{author}**")
+    if st.button("Выйти", use_container_width=True):
+        st.session_state.pop("user", None)
+        st.query_params.clear()
+        st.rerun()
 
 g, c = tuple(grps), tuple(cats)
 
@@ -563,16 +625,13 @@ with tab_edit:
             b.metric("Изменено", len(changed))
 
             if st.button("Сохранить план", type="primary", disabled=changed.empty):
-                if not author:
-                    st.error("Укажите email слева — правки сохраняются с автором.")
-                else:
-                    try:
-                        n = save_overrides(changed, author, note)
-                        st.cache_data.clear()
-                        st.success(f"Сохранено: {n}. В отчётах появится после пересборки.")
-                        st.rerun()
-                    except Exception as exc:  # noqa: BLE001
-                        st.error(f"Не сохранилось: {exc}")
+                try:
+                    n = save_overrides(changed, author, note)
+                    st.cache_data.clear()
+                    st.success(f"Сохранено: {n}. В отчётах появится после пересборки.")
+                    st.rerun()
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Не сохранилось: {exc}")
 
 # ------------------------------------------------------------------ план/факт
 with tab_cmp:
