@@ -440,6 +440,74 @@ def load_size_curve(groups: tuple) -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=600)
+def load_alerts(groups: tuple, categories: tuple) -> pd.DataFrame:
+    """Собирает проблемы из готовых gold-таблиц в один список.
+    Каждая строка: что случилось, по какой позиции, на сколько единиц."""
+    where_g = ""
+    params: list = []
+    if groups:
+        where_g = "AND group_key IN UNNEST(@groups)"
+        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+    elif categories:
+        where_g = "AND category IN UNNEST(@cats)"
+        params.append(bigquery.ArrayQueryParameter("cats", "STRING", list(categories)))
+
+    where_plain = where_g.replace("AND ", "WHERE ", 1) if where_g else ""
+
+    return run(
+        f"""
+        WITH stockout AS (          -- не хватит товара до конца сезона
+          SELECT 'Не хватит товара'                       AS kind,
+                 group_key                                AS name,
+                 category,
+                 CAST(ROUND(-proj_leftover) AS INT64)     AS units,
+                 CONCAT('доступно ', CAST(ROUND(available) AS STRING),
+                        ', спрос ', CAST(ROUND(forecast_demand) AS STRING))  AS detail,
+                 1 AS prio
+          FROM `{DS}.looker_on_track`
+          WHERE proj_leftover < 0 AND forecast_demand > 0 {where_g}
+        ),
+        overstock AS (             -- останется много после сезона
+          SELECT 'Останется на складе', group_key, category,
+                 CAST(ROUND(proj_leftover) AS INT64),
+                 CONCAT('покрытие ', CAST(ROUND(cover_months, 1) AS STRING), ' мес'),
+                 3
+          FROM `{DS}.looker_on_track`
+          WHERE status LIKE '%overstock%' AND proj_leftover > 0 {where_g}
+        ),
+        noplan AS (                -- позиции без прогноза
+          SELECT 'Нужен ручной план', group_key, CAST(NULL AS STRING),
+                 CAST(ROUND(IFNULL(order_us, 0)) AS INT64),
+                 CONCAT(IFNULL(color, ''), ' ', IFNULL(size, '')),
+                 2
+          FROM `{DS}.new_needs_plan`
+          {where_plain.replace("category IN", "group_key IN") if "category" in where_plain else where_plain}
+        ),
+        oos AS (                   -- теряем продажи из-за отсутствия товара
+          SELECT 'Упущены продажи (OOS)', group_key, ANY_VALUE(category),
+                 CAST(ROUND(SUM(demand_units - sales_units)) AS INT64),
+                 CONCAT('за 3 мес, дней без остатка ',
+                        CAST(ROUND(AVG(oos_days)) AS STRING)),
+                 2
+          FROM `{DS}.looker_fact_monthly`
+          WHERE kind = 'actual'
+            AND month >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 3 MONTH)
+            AND demand_units > sales_units {where_g}
+          GROUP BY group_key
+          HAVING SUM(demand_units - sales_units) > 100
+        )
+        SELECT * FROM stockout
+        UNION ALL SELECT * FROM overstock
+        UNION ALL SELECT * FROM noplan
+        UNION ALL SELECT * FROM oos
+        ORDER BY prio, ABS(units) DESC
+        LIMIT 200
+        """,
+        params,
+    )
+
+
 def save_overrides(rows: pd.DataFrame, author: str, note: str) -> int:
     payload = pd.DataFrame(
         {
@@ -477,6 +545,17 @@ def save_overrides(rows: pd.DataFrame, author: str, note: str) -> int:
     return len(payload)
 
 
+def tab_intro(what: str, action: str) -> None:
+    """Короткое пояснение в начале вкладки: что показано и что с этим делать."""
+    st.markdown(
+        f"<div style='background:#F7F8F9;border-left:3px solid #C9D2DA;"
+        f"padding:10px 14px;margin-bottom:14px;border-radius:0 6px 6px 0;"
+        f"font-size:0.9rem;line-height:1.5'>"
+        f"<b>{what}</b><br><span style='color:#5A6B7A'>{action}</span></div>",
+        unsafe_allow_html=True,
+    )
+
+
 # ------------------------------------------------------------------ фильтры
 try:
     dims = load_dims()
@@ -512,14 +591,75 @@ else:
     scope = " · ".join(parts)
 st.caption(f"Данные BigQuery · {scope}")
 
-(tab_over, tab_track, tab_needs, tab_dims,
+(tab_alert, tab_over, tab_track, tab_needs, tab_dims,
  tab_edit, tab_curve, tab_cmp, tab_gap, tab_hist) = st.tabs(
-    ["Обзор", "Сезон", "Требует плана", "Разрезы",
+    ["Внимание", "Обзор", "Сезон", "Требует плана", "Разрезы",
      "Ввод плана", "Размерные кривые", "План и факт", "Расхождения", "Правки"]
 )
 
+# ------------------------------------------------------------------ внимание
+with tab_alert:
+    tab_intro(
+        "Что горит прямо сейчас — по всем группам сразу.",
+        "Сверху то, что требует решения на этой неделе: дефицит, позиции без "
+        "плана, потери от отсутствия товара. Снизу перезатаренные — их "
+        "смотрят перед следующей закупкой."
+    )
+    try:
+        al = load_alerts(g, c)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Не удалось собрать список: {exc}")
+        al = pd.DataFrame()
+
+    if al.empty:
+        st.success("Ничего срочного не нашлось.")
+    else:
+        KIND_COLOR = {
+            "Не хватит товара": "#B5524A",
+            "Нужен ручной план": "#C8752B",
+            "Упущены продажи (OOS)": "#C8752B",
+            "Останется на складе": "#7C8B99",
+        }
+
+        counts = al.groupby("kind")["units"].agg(["count", "sum"])
+        cols = st.columns(len(counts))
+        for col, (kind, row) in zip(cols, counts.iterrows()):
+            col.metric(kind, int(row["count"]),
+                       f"{row['sum']:+,.0f}".replace(",", " ") + " ед.")
+
+        st.caption(
+            "Сверху то, что горит. «Не хватит товара» — доступного меньше "
+            "прогноза до конца сезона. «Упущены продажи» — разрыв между "
+            "спросом и продажами за последние три месяца."
+        )
+
+        for kind in ["Не хватит товара", "Нужен ручной план",
+                     "Упущены продажи (OOS)", "Останется на складе"]:
+            part = al[al["kind"] == kind]
+            if part.empty:
+                continue
+
+            st.markdown(
+                f"<span style='color:{KIND_COLOR.get(kind, INK)};font-weight:600'>"
+                f"{kind}</span> · {len(part)}",
+                unsafe_allow_html=True,
+            )
+            show = part[["name", "category", "units", "detail"]].head(15).rename(
+                columns={"name": "Позиция", "category": "Категория",
+                         "units": "Единиц", "detail": "Подробности"})
+            st.dataframe(show, hide_index=True, use_container_width=True,
+                         height=min(400, 40 + 35 * len(show)))
+            if len(part) > 15:
+                st.caption(f"…и ещё {len(part) - 15}")
+            st.write("")
+
 # ------------------------------------------------------------------ обзор
 with tab_over:
+    tab_intro(
+        "Спрос за последний год и прогноз на следующий.",
+        "Быстро понять, растём или падаем и чего ждать. Ниже — сколько продаж "
+        "потеряли из-за отсутствия товара на складе."
+    )
     s = load_series(g, c)
     if s.empty:
         st.info("По этим фильтрам данных нет.")
@@ -607,6 +747,11 @@ with tab_over:
 
 # ------------------------------------------------------------------ сезон
 with tab_track:
+    tab_intro(
+        "Хватит ли товара до конца сезона.",
+        "Считается так: на руках плюс в пути минус прогноз спроса. "
+        "Красное — решать сейчас, серое — прогноза нет."
+    )
     level = st.radio("Уровень", ["Категории", "Группы"], horizontal=True,
                      label_visibility="collapsed")
     tr = load_on_track("category" if level == "Категории" else "group", g, c)
@@ -648,6 +793,11 @@ with tab_track:
 
 # ------------------------------------------------------------------ требует плана
 with tab_needs:
+    tab_intro(
+        "Позиции, которым модель не смогла дать прогноз.",
+        "Новая линейка без истории продаж или не проставлен Order US. "
+        "План по ним ставится руками — других вариантов нет."
+    )
     needs = load_needs_plan()
     if needs.empty:
         st.success("Все позиции получили прогноз. Ручное планирование не требуется.")
@@ -666,7 +816,11 @@ with tab_needs:
 
 # ------------------------------------------------------------------ разрезы
 with tab_dims:
-    st.caption("Прогноз на весь горизонт, по измерениям")
+    tab_intro(
+        "Из чего складывается прогноз: размеры, цвета, категории, ABCD.",
+        "Смотреть, чтобы понять структуру спроса — например, какая доля "
+        "приходится на чёрный или на размер L."
+    )
     col1, col2 = st.columns(2)
     targets = [
         (col1, "size", "Размеры"),
@@ -695,6 +849,12 @@ with tab_dims:
 
 # ------------------------------------------------------------------ ввод
 with tab_edit:
+    tab_intro(
+        "Ручной ввод плана продаж по группе и цвету.",
+        "Цифры считаются автоматически — правьте только там, где знаете "
+        "больше модели. Размеры раскладываются сами. Правки переживают "
+        "пересборку и попадают в расчёт на следующий день."
+    )
     planned = load_planned_groups()
     editable = [x for x in grps if x in planned]
     skipped = [x for x in grps if x not in planned]
@@ -801,10 +961,10 @@ with tab_edit:
 
 # ------------------------------------------------------------------ кривые
 with tab_curve:
-    st.caption(
-        "Доля каждого размера внутри группы, по календарным месяцам. "
-        "Считается из истории спроса — по этим долям прогноз группы "
-        "раскладывается на размеры."
+    tab_intro(
+        "Доля каждого размера внутри группы, по месяцам.",
+        "По этим долям прогноз группы раскладывается на размеры. "
+        "Считается из истории спроса. Пока только просмотр."
     )
 
     if not grps:
@@ -902,6 +1062,12 @@ with tab_curve:
 
 # ------------------------------------------------------------------ план/факт
 with tab_cmp:
+    tab_intro(
+        "Четыре ряда рядом: факт, старый план, два наших прогноза.",
+        "Нужно, чтобы видеть, насколько новый расчёт отличается от того, "
+        "как планировали раньше. Ряды покрывают разные периоды — "
+        "сравнивать можно только на общих месяцах."
+    )
     cmp_df = load_plan_compare(g)
     if cmp_df.empty:
         st.info("Сравнение недоступно.")
@@ -938,10 +1104,11 @@ with tab_cmp:
 
 # ------------------------------------------------------------------ расхождения
 with tab_gap:
-    st.caption(
-        "Где прогноз расходится со старым планом и почему. Сравнение только "
-        "по месяцам, которые покрыты обоими рядами — иначе разница показывала "
-        "бы разницу периодов, а не планов. Смотреть сверху вниз."
+    tab_intro(
+        "Где прогноз разошёлся со старым планом и почему.",
+        "Сортировка по величине разницы — сверху самые большие деньги. "
+        "Сравниваются только месяцы, покрытые обоими рядами. "
+        "Внизу причины, которые система определила сама."
     )
 
     gap = load_gap(g)
@@ -1015,6 +1182,11 @@ with tab_gap:
 
 # ------------------------------------------------------------------ правки
 with tab_hist:
+    tab_intro(
+        "Журнал ручных правок плана.",
+        "Видно, кто и когда изменил цифру и с каким комментарием. "
+        "Правки не перезаписываются — каждая ложится новой строкой."
+    )
     hist_where = ""
     hist_params: list = []
     if grps:
