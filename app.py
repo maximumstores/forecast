@@ -1162,6 +1162,8 @@ with tab_target:
             if view_mode == "Проекция":
                 pv = tg.pivot_table(index=["group_key", "color"], columns="месяц",
                                     values="stock_proj", aggfunc="sum").reset_index()
+                for mc in [x for x in pv.columns if x not in ("group_key", "color")]:
+                    pv[mc] = pd.to_numeric(pv[mc], errors="coerce").round(0)
                 st.dataframe(pv, hide_index=True, use_container_width=True,
                              height=440)
                 st.caption("Остаток на конец месяца по текущему плану и приходам.")
@@ -1178,12 +1180,22 @@ with tab_target:
                 )
 
             else:
+                # pivot_table по умолчанию схлопывает NaN в 0 — нам нужна
+                # разница между «цель не задана» и «цель равна нулю»
                 grid_t = tg.pivot_table(index=["group_key", "color"],
                                         columns="месяц", values="target_units",
-                                        aggfunc="sum").reset_index()
-                for mc in [x for x in grid_t.columns
-                           if x not in ("group_key", "color")]:
+                                        aggfunc="sum", dropna=False).reset_index()
+                months_t = [x for x in grid_t.columns
+                            if x not in ("group_key", "color")]
+                has_t = tg.pivot_table(index=["group_key", "color"],
+                                       columns="месяц", values="target_units",
+                                       aggfunc="count").reset_index()
+                for mc in months_t:
                     grid_t[mc] = pd.to_numeric(grid_t[mc], errors="coerce")
+                    if mc in has_t.columns:
+                        mask = has_t.set_index(["group_key", "color"])[mc].fillna(0) == 0
+                        idx = grid_t.set_index(["group_key", "color"]).index
+                        grid_t.loc[[bool(mask.get(i, True)) for i in idx], mc] = pd.NA
 
                 st.caption("Впишите целевой остаток. Пусто — цель не задана.")
                 ed_t = st.data_editor(
@@ -1738,4 +1750,4 @@ with tab_hist:
     if hist.empty:
         st.info("Ручных правок ещё нет. Первая появится здесь сразу после сохранения.")
     else:
-        st.dataframe(hist, hide_index=True, use_container_width=True) 
+        st.dataframe(hist, hide_index=True, use_container_width=True)
