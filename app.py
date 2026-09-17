@@ -518,6 +518,72 @@ def load_alerts(groups: tuple, categories: tuple) -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=600)
+def load_stock(groups: tuple, categories: tuple) -> pd.DataFrame:
+    """Остатки и движение по месяцам: что на складе, что приедет,
+    сколько спланировано и что останется."""
+    where: list[str] = []
+    params: list = []
+    if groups:
+        where.append("p.group_key IN UNNEST(@groups)")
+        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+    elif categories:
+        where.append("d.category IN UNNEST(@cats)")
+        params.append(bigquery.ArrayQueryParameter("cats", "STRING", list(categories)))
+    clause = "WHERE " + " AND ".join(where) if where else ""
+
+    return run(
+        f"""
+        SELECT p.month,
+               SUM(p.stock_bom)   AS stock_start,
+               SUM(p.incoming)    AS incoming,
+               SUM(p.plan_units)  AS plan_units,
+               SUM(p.stock_eom)   AS stock_end,
+               COUNTIF(p.is_stockout) AS stockout_skus
+        FROM `{DS}.psi_projection` p
+        LEFT JOIN (SELECT DISTINCT group_key, category
+                   FROM `{DS}.dim_product` WHERE group_key IS NOT NULL) d
+          ON d.group_key = p.group_key
+        {clause}
+        GROUP BY p.month
+        ORDER BY p.month
+        """,
+        params,
+    )
+
+
+@st.cache_data(ttl=600)
+def load_stockouts(groups: tuple, categories: tuple) -> pd.DataFrame:
+    """Позиции, которые кончатся раньше всего."""
+    where: list[str] = ["f.first_stockout_month IS NOT NULL"]
+    params: list = []
+    if groups:
+        where.append("f.group_key IN UNNEST(@groups)")
+        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+    elif categories:
+        where.append("d.category IN UNNEST(@cats)")
+        params.append(bigquery.ArrayQueryParameter("cats", "STRING", list(categories)))
+
+    return run(
+        f"""
+        SELECT f.group_key, f.asin, f.first_stockout_month,
+               d.category,
+               ROUND(SUM(p.plan_units)) AS plan_after
+        FROM `{DS}.psi_first_stockout` f
+        LEFT JOIN (SELECT DISTINCT group_key, category
+                   FROM `{DS}.dim_product` WHERE group_key IS NOT NULL) d
+          ON d.group_key = f.group_key
+        LEFT JOIN `{DS}.psi_projection` p
+          ON p.product_key = f.product_key AND p.month >= f.first_stockout_month
+        WHERE {' AND '.join(where)}
+        GROUP BY 1, 2, 3, 4
+        ORDER BY f.first_stockout_month, plan_after DESC
+        LIMIT 100
+        """,
+        params,
+    )
+
+
 def save_overrides(rows: pd.DataFrame, author: str, note: str) -> int:
     payload = pd.DataFrame(
         {
@@ -601,9 +667,9 @@ else:
     scope = " · ".join(parts)
 st.caption(f"Данные BigQuery · {scope}")
 
-(tab_alert, tab_over, tab_track, tab_needs, tab_dims,
+(tab_alert, tab_over, tab_track, tab_stock, tab_needs, tab_dims,
  tab_edit, tab_curve, tab_cmp, tab_gap, tab_hist) = st.tabs(
-    ["Внимание", "Обзор", "Сезон", "Требует плана", "Разрезы",
+    ["Внимание", "Обзор", "Сезон", "Склад", "Требует плана", "Разрезы",
      "Ввод плана", "Размерные кривые", "План и факт", "Расхождения", "Правки"]
 )
 
@@ -800,6 +866,100 @@ with tab_track:
                 "Покрытие, мес": st.column_config.NumberColumn(format="%.1f"),
             },
         )
+
+# ------------------------------------------------------------------ склад
+with tab_stock:
+    tab_intro(
+        "Что на складе сейчас и что будет по месяцам.",
+        "Начальный остаток плюс приход минус план равно остаток на конец. "
+        "Если план больше доступного — товар кончится, и это видно заранее."
+    )
+
+    try:
+        stk = load_stock(g, c)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Не удалось прочитать проекцию склада: {exc}")
+        stk = pd.DataFrame()
+
+    if stk.empty:
+        st.info("По этим фильтрам проекции нет.")
+    else:
+        stk["month"] = pd.to_datetime(stk["month"])
+        first = stk.iloc[0]
+        total_in = stk["incoming"].sum()
+        total_plan = stk["plan_units"].sum()
+        last_stock = stk.iloc[-1]["stock_end"]
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("На складе сейчас",
+                  f"{first['stock_start']:,.0f}".replace(",", " "))
+        k2.metric("Придёт за период",
+                  f"{total_in:,.0f}".replace(",", " "))
+        k3.metric("Уйдёт по плану",
+                  f"{total_plan:,.0f}".replace(",", " "))
+        k4.metric("Останется в конце",
+                  f"{last_stock:,.0f}".replace(",", " "),
+                  help="Если близко к нулю — товара впритык")
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=stk["month"], y=stk["incoming"], name="приход",
+            marker_color="#8FAF9A",
+            hovertemplate="приход %{y:,.0f}<extra></extra>"))
+        fig.add_trace(go.Bar(
+            x=stk["month"], y=-stk["plan_units"], name="план продаж",
+            marker_color="#D8A48F",
+            hovertemplate="план %{y:,.0f}<extra></extra>"))
+        fig.add_trace(go.Scatter(
+            x=stk["month"], y=stk["stock_end"], name="остаток на конец месяца",
+            mode="lines+markers", line=dict(color=FACT, width=2.5),
+            hovertemplate="остаток %{y:,.0f}<extra></extra>"))
+        fig.update_layout(
+            height=400, margin=dict(l=0, r=0, t=10, b=0), barmode="relative",
+            plot_bgcolor="white", paper_bgcolor="white", hovermode="x unified",
+            font=dict(color=INK, size=12),
+            legend=dict(orientation="h", y=1.12, x=0),
+            xaxis=dict(showgrid=False, linecolor="#DDE3E8"),
+            yaxis=dict(gridcolor="#EEF1F4", zeroline=True,
+                       zerolinecolor="#C9D2DA", title="единиц"),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        tbl = stk.copy()
+        tbl["Месяц"] = tbl["month"].dt.strftime("%Y-%m")
+        tbl = tbl[["Месяц", "stock_start", "incoming", "plan_units",
+                   "stock_end", "stockout_skus"]].rename(columns={
+            "stock_start": "На начало", "incoming": "Приход",
+            "plan_units": "План продаж", "stock_end": "На конец",
+            "stockout_skus": "SKU без остатка",
+        })
+        for col in ["На начало", "Приход", "План продаж", "На конец"]:
+            tbl[col] = tbl[col].round(0)
+        st.dataframe(tbl, hide_index=True, use_container_width=True, height=330)
+
+        st.markdown("**Что кончится раньше всего**")
+        try:
+            so = load_stockouts(g, c)
+            if so.empty:
+                st.caption("Ни одна позиция не уходит в ноль на горизонте плана.")
+            else:
+                so["first_stockout_month"] = pd.to_datetime(
+                    so["first_stockout_month"]).dt.strftime("%Y-%m")
+                show = so.head(25).rename(columns={
+                    "group_key": "Группа", "asin": "ASIN",
+                    "first_stockout_month": "Кончится в",
+                    "category": "Категория",
+                    "plan_after": "План после этого месяца",
+                })
+                st.dataframe(show, hide_index=True, use_container_width=True,
+                             height=400)
+                st.caption(
+                    "«План после этого месяца» — сколько ещё планировали продать "
+                    "после того, как товар кончится. Это и есть упущенные продажи, "
+                    "если ничего не заказать."
+                )
+        except Exception as exc:  # noqa: BLE001
+            st.caption(f"Список недоступен: {exc}")
 
 # ------------------------------------------------------------------ требует плана
 with tab_needs:
