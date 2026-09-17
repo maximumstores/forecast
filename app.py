@@ -584,6 +584,23 @@ def load_stockouts(groups: tuple, categories: tuple) -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=3600)
+def load_config() -> dict:
+    """Параметры планирования: границы сезона, lead time, пороги."""
+    df = run(
+        f"""
+        SELECT season_start, season_end, lead_time_months,
+               review_period_months, peak_months,
+               service_level_peak, service_level_offpeak,
+               growth_cap_lo, growth_cap_hi,
+               overstock_red_ratio, understock_red_ratio,
+               moq_default, carton_default
+        FROM `{DS}.config` LIMIT 1
+        """
+    )
+    return df.iloc[0].to_dict() if not df.empty else {}
+
+
 def save_overrides(rows: pd.DataFrame, author: str, note: str) -> int:
     payload = pd.DataFrame(
         {
@@ -823,10 +840,26 @@ with tab_over:
 
 # ------------------------------------------------------------------ сезон
 with tab_track:
+    cfg = load_config()
+    if cfg:
+        s_start = pd.to_datetime(cfg["season_start"]).strftime("%d.%m.%Y")
+        s_end = pd.to_datetime(cfg["season_end"]).strftime("%d.%m.%Y")
+        months = (pd.to_datetime(cfg["season_end"]).to_period("M")
+                  - pd.to_datetime(cfg["season_start"]).to_period("M")).n + 1
+        season_line = (
+            f"Сезон задан с {s_start} по {s_end} — это {months} мес. "
+            f"Запас считается против спроса за этот период, поэтому годовой "
+            f"объём товара выглядит как избыток. Границу сезона задаёт "
+            f"настройка в системе, не прогноз."
+        )
+    else:
+        season_line = "Границы сезона берутся из настроек системы."
+
     tab_intro(
         "Хватит ли товара до конца сезона.",
         "Считается так: на руках плюс в пути минус прогноз спроса. "
-        "Красное — решать сейчас, серое — прогноза нет."
+        "Красное — решать сейчас, серое — прогноза нет.<br>"
+        f"<i>{season_line}</i>"
     )
     level = st.radio("Уровень", ["Категории", "Группы"], horizontal=True,
                      label_visibility="collapsed")
@@ -866,6 +899,29 @@ with tab_track:
                 "Покрытие, мес": st.column_config.NumberColumn(format="%.1f"),
             },
         )
+
+        if cfg:
+            with st.expander("Параметры, по которым это считается"):
+                p1, p2 = st.columns(2)
+                with p1:
+                    st.markdown(
+                        f"**Сезон:** {s_start} — {s_end} ({months} мес)  \n"
+                        f"**Срок поставки:** {cfg['lead_time_months']} мес  \n"
+                        f"**Периодичность заказа:** {cfg['review_period_months']} мес  \n"
+                        f"**Пиковые месяцы:** {cfg['peak_months']}"
+                    )
+                with p2:
+                    st.markdown(
+                        f"**Уровень сервиса в пик:** {cfg['service_level_peak']:.0%}  \n"
+                        f"**Вне пика:** {cfg['service_level_offpeak']:.0%}  \n"
+                        f"**Порог «перезатарены»:** {cfg['overstock_red_ratio']:.0%} излишка  \n"
+                        f"**Порог «не хватит»:** {cfg['understock_red_ratio']:.0%} дефицита"
+                    )
+                st.caption(
+                    "Эти значения задаются в таблице настроек и меняются "
+                    "бизнесом, а не разработчиком. От них напрямую зависит, "
+                    "какие позиции попадут в красное."
+                )
 
 # ------------------------------------------------------------------ склад
 with tab_stock:
