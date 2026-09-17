@@ -969,4 +969,4 @@ with tab_hist:
     if hist.empty:
         st.info("Ручных правок ещё нет. Первая появится здесь сразу после сохранения.")
     else:
-        st.dataframe(hist, hide_index=True, use_container_width=True)
+        st.dataframe(hist, hide_index=True, use_container_width=True) 
