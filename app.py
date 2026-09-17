@@ -232,11 +232,22 @@ def load_plan(months_ahead: int, groups: tuple) -> pd.DataFrame:
             WHERE size IS NULL
           ) WHERE rn = 1
         )
+        ,
+        ly AS (
+          SELECT group_key, IFNULL(color,'') AS color,
+                 DATE_ADD(month, INTERVAL 12 MONTH) AS month,
+                 SUM(demand_units) AS fact_ly
+          FROM `{DS}.looker_fact_monthly`
+          WHERE kind = 'actual'
+          GROUP BY 1, 2, 3
+        )
         SELECT a.group_key, a.color, a.month,
                ROUND(a.plan_auto) AS plan_auto,
-               o.override_units, o.author, o.updated_at
+               o.override_units, o.author, o.updated_at,
+               ROUND(l.fact_ly) AS fact_ly
         FROM auto_plan a
         LEFT JOIN ovr o USING (group_key, color, month)
+        LEFT JOIN ly  l USING (group_key, color, month)
         ORDER BY a.group_key, a.color, a.month
         """,
         params,
@@ -314,6 +325,51 @@ def load_oos(groups: tuple, categories: tuple) -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=600)
+def load_gap(groups: tuple) -> pd.DataFrame:
+    """Расхождение старого плана и нашего прогноза по группам."""
+    where = ""
+    params: list = []
+    if groups:
+        where = "WHERE group_key IN UNNEST(@groups)"
+        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+    return run(
+        f"""
+        WITH p AS (
+          SELECT group_key, series, SUM(units) AS units
+          FROM `{DS}.looker_plan_compare`
+          {where}
+          GROUP BY 1, 2
+        )
+        SELECT group_key,
+               MAX(IF(series='Fact',                  units, NULL)) AS fact,
+               MAX(IF(series='Legacy plan',           units, NULL)) AS legacy,
+               MAX(IF(series='Our forecast',          units, NULL)) AS ours,
+               MAX(IF(series='Our forecast (growth)', units, NULL)) AS growth
+        FROM p
+        GROUP BY group_key
+        """,
+        params,
+    )
+
+
+@st.cache_data(ttl=600)
+def load_drivers() -> pd.DataFrame:
+    """Причины расхождения — из готовой таблицы plan_compare."""
+    return run(
+        f"""
+        SELECT category, driver_hint,
+               COUNT(*) AS n,
+               ROUND(SUM(delta_abs)) AS delta_total
+        FROM `{DS}.plan_compare`
+        WHERE flag = 'REVIEW'
+        GROUP BY 1, 2
+        ORDER BY ABS(SUM(delta_abs)) DESC
+        LIMIT 25
+        """
+    )
+
+
 def save_overrides(rows: pd.DataFrame, author: str, note: str) -> int:
     payload = pd.DataFrame(
         {
@@ -385,9 +441,9 @@ else:
 st.caption(f"Данные BigQuery · {scope}")
 
 (tab_over, tab_track, tab_needs, tab_dims,
- tab_edit, tab_cmp, tab_hist) = st.tabs(
+ tab_edit, tab_cmp, tab_gap, tab_hist) = st.tabs(
     ["Обзор", "Сезон", "Требует плана", "Разрезы",
-     "Ввод плана", "План и факт", "Правки"]
+     "Ввод плана", "План и факт", "Расхождения", "Правки"]
 )
 
 # ------------------------------------------------------------------ обзор
@@ -593,8 +649,34 @@ with tab_edit:
         else:
             df["месяц"] = pd.to_datetime(df["month"]).dt.strftime("%Y-%m")
             df["план"] = df["override_units"].fillna(df["plan_auto"])
-            grid = df.pivot_table(index=["group_key", "color"], columns="месяц",
-                                  values="план", aggfunc="sum").reset_index()
+
+            manual_cnt = int(df["override_units"].notna().sum())
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Ячеек в плане", len(df))
+            c2.metric("Правлено руками", manual_cnt)
+            c3.metric("План на период",
+                      f"{df['план'].sum():,.0f}".replace(",", " "))
+
+            show_all = st.toggle(
+                "Показать расчёт системы и прошлый год",
+                help="Сравнение: что посчитала модель, что было год назад, "
+                     "и что стоит сейчас",
+            )
+
+            if show_all:
+                cmp_tbl = df[["group_key", "color", "месяц", "fact_ly",
+                              "plan_auto", "override_units", "план"]].rename(
+                    columns={
+                        "group_key": "Группа", "color": "Цвет", "месяц": "Месяц",
+                        "fact_ly": "Год назад", "plan_auto": "Расчёт системы",
+                        "override_units": "Правка руками", "план": "Итог",
+                    })
+                st.dataframe(cmp_tbl, hide_index=True,
+                             use_container_width=True, height=360)
+                st.caption(
+                    "Пустая «Правка руками» — берётся расчёт системы. "
+                    "Ниже — сетка для ввода."
+                )
 
             st.caption("Правьте цифры прямо в таблице. Пусто — считается автоматически.")
             edited = st.data_editor(
@@ -660,6 +742,79 @@ with tab_cmp:
         )
         st.plotly_chart(fig, use_container_width=True)
         st.caption("Legacy plan — старый план из таблиц, для сверки.")
+
+# ------------------------------------------------------------------ расхождения
+with tab_gap:
+    st.caption(
+        "Где наш прогноз расходится со старым планом и почему. "
+        "Смотреть сверху вниз — там самые большие деньги."
+    )
+
+    gap = load_gap(g)
+    if gap.empty:
+        st.info("Сравнение недоступно.")
+    else:
+        gap["delta"] = gap["ours"].fillna(0) - gap["legacy"].fillna(0)
+        gap["delta_pct"] = gap["delta"] / gap["legacy"].replace(0, pd.NA) * 100
+        gap = gap.reindex(gap["delta"].abs().sort_values(ascending=False).index)
+
+        tot_legacy = gap["legacy"].sum()
+        tot_ours = gap["ours"].sum()
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Старый план", f"{tot_legacy:,.0f}".replace(",", " "))
+        k2.metric("Наш прогноз", f"{tot_ours:,.0f}".replace(",", " "))
+        k3.metric(
+            "Разница",
+            f"{tot_ours - tot_legacy:+,.0f}".replace(",", " "),
+            f"{(tot_ours / tot_legacy - 1) * 100:+.1f}%" if tot_legacy else None,
+        )
+
+        show = gap.head(20).copy()
+        fig = go.Figure(go.Bar(
+            x=show["delta"], y=show["group_key"], orientation="h",
+            marker_color=["#B5524A" if v < 0 else "#4A7C59" for v in show["delta"]],
+            hovertemplate="%{y}: %{x:+,.0f}<extra></extra>"))
+        fig.update_layout(
+            height=max(260, 24 * len(show)), margin=dict(l=0, r=0, t=4, b=0),
+            plot_bgcolor="white", paper_bgcolor="white",
+            font=dict(color=INK, size=12),
+            xaxis=dict(gridcolor="#EEF1F4", zeroline=True, zerolinecolor="#C9D2DA",
+                       title="наш прогноз минус старый план, единиц"),
+            yaxis=dict(autorange="reversed"),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Зелёное — планируем больше прежнего, красное — меньше.")
+
+        tbl = gap[["group_key", "fact", "legacy", "ours", "growth",
+                   "delta", "delta_pct"]].rename(columns={
+            "group_key": "Группа", "fact": "Факт",
+            "legacy": "Старый план", "ours": "Наш прогноз",
+            "growth": "Прогноз по росту", "delta": "Разница",
+            "delta_pct": "Разница, %",
+        })
+        st.dataframe(
+            tbl, hide_index=True, use_container_width=True, height=420,
+            column_config={
+                "Разница, %": st.column_config.NumberColumn(format="%.0f%%"),
+            },
+        )
+
+    st.markdown("**Из-за чего расходимся**")
+    st.caption("Причины по позициям, где разница больше 20%.")
+    try:
+        dr = load_drivers()
+        if dr.empty:
+            st.caption("Существенных расхождений нет.")
+        else:
+            st.dataframe(
+                dr.rename(columns={
+                    "category": "Категория", "driver_hint": "Причина",
+                    "n": "Позиций", "delta_total": "Суммарная разница",
+                }),
+                hide_index=True, use_container_width=True, height=380,
+            )
+    except Exception as exc:  # noqa: BLE001
+        st.caption(f"Причины недоступны: {exc}")
 
 # ------------------------------------------------------------------ правки
 with tab_hist:
