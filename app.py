@@ -370,6 +370,43 @@ def load_drivers() -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=600)
+def load_size_curve(groups: tuple) -> pd.DataFrame:
+    """Доли размеров внутри группы по календарным месяцам — та же логика,
+    что внутри asin_forecast, но посчитанная отдельно для просмотра."""
+    where = ["p.group_key IS NOT NULL", "p.active_us", "NOT p.is_new"]
+    params: list = []
+    if groups:
+        where.append("p.group_key IN UNNEST(@groups)")
+        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+
+    return run(
+        f"""
+        WITH cell_hist AS (
+          SELECT p.group_key,
+                 COALESCE(p.size, '(none)')  AS size,
+                 EXTRACT(MONTH FROM d.month) AS cal_month,
+                 SUM(d.demand)               AS demand
+          FROM `{DS}.fact_demand_raw` d
+          JOIN `{DS}.dim_product`     p ON p.asin = d.asin
+          WHERE {' AND '.join(where)}
+          GROUP BY 1, 2, 3
+        ),
+        grp AS (
+          SELECT group_key, cal_month, SUM(demand) AS g_demand
+          FROM cell_hist GROUP BY 1, 2
+        )
+        SELECT h.group_key, h.size, h.cal_month,
+               ROUND(SAFE_DIVIDE(h.demand, NULLIF(g.g_demand, 0)) * 100, 1) AS share_pct,
+               ROUND(h.demand) AS demand
+        FROM cell_hist h
+        JOIN grp g USING (group_key, cal_month)
+        ORDER BY h.group_key, h.cal_month, share_pct DESC
+        """,
+        params,
+    )
+
+
 def save_overrides(rows: pd.DataFrame, author: str, note: str) -> int:
     payload = pd.DataFrame(
         {
@@ -441,9 +478,9 @@ else:
 st.caption(f"Данные BigQuery · {scope}")
 
 (tab_over, tab_track, tab_needs, tab_dims,
- tab_edit, tab_cmp, tab_gap, tab_hist) = st.tabs(
+ tab_edit, tab_curve, tab_cmp, tab_gap, tab_hist) = st.tabs(
     ["Обзор", "Сезон", "Требует плана", "Разрезы",
-     "Ввод плана", "План и факт", "Расхождения", "Правки"]
+     "Ввод плана", "Размерные кривые", "План и факт", "Расхождения", "Правки"]
 )
 
 # ------------------------------------------------------------------ обзор
@@ -715,6 +752,60 @@ with tab_edit:
                 except Exception as exc:  # noqa: BLE001
                     st.error(f"Не сохранилось: {exc}")
 
+# ------------------------------------------------------------------ кривые
+with tab_curve:
+    st.caption(
+        "Доля каждого размера внутри группы, по календарным месяцам. "
+        "Считается из истории спроса — по этим долям прогноз группы "
+        "раскладывается на размеры."
+    )
+
+    if not grps:
+        st.info("Выберите группу слева — кривые показываются по одной группе.")
+    else:
+        cur = load_size_curve(tuple(grps[:3]))
+        if cur.empty:
+            st.info("По этим группам истории нет.")
+        else:
+            MONTHS = {1: "янв", 2: "фев", 3: "мар", 4: "апр", 5: "май", 6: "июн",
+                      7: "июл", 8: "авг", 9: "сен", 10: "окт", 11: "ноя", 12: "дек"}
+
+            for gk in cur["group_key"].unique():
+                sub = cur[cur["group_key"] == gk]
+                st.markdown(f"**{gk}**")
+
+                piv = sub.pivot_table(index="size", columns="cal_month",
+                                      values="share_pct", aggfunc="sum")
+                piv = piv.reindex(sorted(piv.columns), axis=1)
+                piv.columns = [MONTHS.get(c, c) for c in piv.columns]
+
+                fig = go.Figure()
+                for size in piv.index:
+                    fig.add_trace(go.Scatter(
+                        x=piv.columns, y=piv.loc[size], mode="lines+markers",
+                        name=str(size), line=dict(width=2)))
+                fig.update_layout(
+                    height=300, margin=dict(l=0, r=0, t=6, b=0),
+                    plot_bgcolor="white", paper_bgcolor="white",
+                    font=dict(color=INK, size=12), hovermode="x unified",
+                    legend=dict(orientation="h", y=1.15, x=0),
+                    xaxis=dict(showgrid=False, linecolor="#DDE3E8"),
+                    yaxis=dict(gridcolor="#EEF1F4", zeroline=False,
+                               title="доля, %"),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.dataframe(
+                    piv.round(1).reset_index().rename(columns={"size": "Размер"}),
+                    hide_index=True, use_container_width=True,
+                )
+                st.divider()
+
+            st.caption(
+                "Пока только просмотр. Ручная правка кривых потребует изменений "
+                "в расчёте прогноза — обсудить с Серёжей."
+            )
+
 # ------------------------------------------------------------------ план/факт
 with tab_cmp:
     cmp_df = load_plan_compare(g)
@@ -831,4 +922,4 @@ with tab_hist:
     if hist.empty:
         st.info("Ручных правок ещё нет. Первая появится здесь сразу после сохранения.")
     else:
-        st.dataframe(hist, hide_index=True, use_container_width=True) 
+        st.dataframe(hist, hide_index=True, use_container_width=True)
