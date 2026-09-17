@@ -454,8 +454,10 @@ def save_overrides(rows: pd.DataFrame, author: str, note: str) -> int:
             "updated_at": dt.datetime.now(dt.timezone.utc),
         }
     )
+    # group_key в таблице объявлен REQUIRED — режим надо повторить,
+    # иначе BigQuery считает загрузку изменением схемы и отклоняет её
     schema = [
-        bigquery.SchemaField("group_key", "STRING"),
+        bigquery.SchemaField("group_key", "STRING", mode="REQUIRED"),
         bigquery.SchemaField("color", "STRING"),
         bigquery.SchemaField("size", "STRING"),
         bigquery.SchemaField("month", "DATE"),
@@ -728,7 +730,8 @@ with tab_edit:
             manual_cnt = int(df["override_units"].notna().sum())
             c1, c2, c3 = st.columns(3)
             c1.metric("Ячеек в плане", len(df))
-            c2.metric("Правлено руками", manual_cnt)
+            c2.metric("Правок сохранено", manual_cnt,
+                      help="Сколько ячеек уже переопределено вручную и лежит в базе")
             c3.metric("План на период",
                       f"{df['план'].sum():,.0f}".replace(",", " "))
 
@@ -756,7 +759,10 @@ with tab_edit:
             grid = df.pivot_table(index=["group_key", "color"], columns="месяц",
                                   values="план", aggfunc="sum").reset_index()
 
-            st.caption("Правьте цифры прямо в таблице. Пусто — считается автоматически.")
+            st.caption(
+                "Правьте цифры прямо в таблице, потом прокрутите вниз — "
+                "под таблицей кнопка сохранения."
+            )
             edited = st.data_editor(
                 grid, hide_index=True, use_container_width=True, height=480,
                 column_config={
@@ -1031,4 +1037,4 @@ with tab_hist:
     if hist.empty:
         st.info("Ручных правок ещё нет. Первая появится здесь сразу после сохранения.")
     else:
-        st.dataframe(hist, hide_index=True, use_container_width=True) 
+        st.dataframe(hist, hide_index=True, use_container_width=True)
