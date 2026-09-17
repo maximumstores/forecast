@@ -769,36 +769,83 @@ with tab_curve:
         else:
             MONTHS = {1: "янв", 2: "фев", 3: "мар", 4: "апр", 5: "май", 6: "июн",
                       7: "июл", 8: "авг", 9: "сен", 10: "окт", 11: "ноя", 12: "дек"}
+            SIZE_ORDER = ["XXS", "X-Small", "XS", "Small", "S", "Medium", "M",
+                          "Large", "L", "X-Large", "XL", "XX-Large", "XXL",
+                          "XXX-Large", "XXXL", "One size", "One Size"]
+
+            def size_key(s: str) -> tuple:
+                s = str(s)
+                for i, name in enumerate(SIZE_ORDER):
+                    if s.lower() == name.lower():
+                        return (0, i, s)
+                return (1, 0, s)
 
             for gk in cur["group_key"].unique():
                 sub = cur[cur["group_key"] == gk]
+                sizes = sorted(sub["size"].unique(), key=size_key)
+
                 st.markdown(f"**{gk}**")
+
+                if len(sizes) < 2:
+                    st.caption(
+                        f"У группы один размер ({sizes[0] if sizes else '—'}) — "
+                        "раскладывать нечего, весь прогноз идёт на него."
+                    )
+                    st.divider()
+                    continue
 
                 piv = sub.pivot_table(index="size", columns="cal_month",
                                       values="share_pct", aggfunc="sum")
-                piv = piv.reindex(sorted(piv.columns), axis=1)
-                piv.columns = [MONTHS.get(c, c) for c in piv.columns]
+                dem = sub.pivot_table(index="size", columns="cal_month",
+                                      values="demand", aggfunc="sum")
+                months = sorted(piv.columns)
+                piv = piv.reindex(index=sizes, columns=months)
+                dem = dem.reindex(index=sizes, columns=months)
+
+                # месяцы, где у группы вообще не было спроса
+                month_demand = dem.sum(axis=0, min_count=1).fillna(0)
+                dead = [m for m in months if month_demand.get(m, 0) == 0]
+                live = [m for m in months if m not in dead]
 
                 fig = go.Figure()
-                for size in piv.index:
+                for size in sizes:
                     fig.add_trace(go.Scatter(
-                        x=piv.columns, y=piv.loc[size], mode="lines+markers",
-                        name=str(size), line=dict(width=2)))
+                        x=[MONTHS.get(m, m) for m in live],
+                        y=[piv.loc[size, m] for m in live],
+                        mode="lines+markers", name=str(size), line=dict(width=2),
+                        hovertemplate="%{y:.1f}%<extra>" + str(size) + "</extra>"))
                 fig.update_layout(
-                    height=300, margin=dict(l=0, r=0, t=6, b=0),
+                    height=320, margin=dict(l=0, r=0, t=6, b=0),
                     plot_bgcolor="white", paper_bgcolor="white",
                     font=dict(color=INK, size=12), hovermode="x unified",
                     legend=dict(orientation="h", y=1.15, x=0),
                     xaxis=dict(showgrid=False, linecolor="#DDE3E8"),
                     yaxis=dict(gridcolor="#EEF1F4", zeroline=False,
-                               title="доля, %"),
+                               title="доля, %", rangemode="tozero"),
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
-                st.dataframe(
-                    piv.round(1).reset_index().rename(columns={"size": "Размер"}),
-                    hide_index=True, use_container_width=True,
-                )
+                if dead:
+                    st.caption(
+                        "Месяцы без продаж у группы (доля не считается): " +
+                        ", ".join(MONTHS.get(m, str(m)) for m in dead)
+                    )
+
+                tbl = piv[live].round(1)
+                tbl.columns = [MONTHS.get(m, m) for m in live]
+                tbl = tbl.reset_index().rename(columns={"size": "Размер"})
+                st.dataframe(tbl, hide_index=True, use_container_width=True)
+
+                with st.expander("Спрос, на котором посчитаны доли"):
+                    dtb = dem[live].fillna(0).astype(int)
+                    dtb.columns = [MONTHS.get(m, m) for m in live]
+                    dtb = dtb.reset_index().rename(columns={"size": "Размер"})
+                    st.dataframe(dtb, hide_index=True, use_container_width=True)
+                    st.caption(
+                        "Чем меньше спрос в месяце, тем случайнее доля. "
+                        "Пара десятков штук — уже шум, а не сезонность."
+                    )
+
                 st.divider()
 
             st.caption(
