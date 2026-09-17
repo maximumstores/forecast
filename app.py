@@ -167,7 +167,7 @@ def load_series(groups: tuple, categories: tuple) -> pd.DataFrame:
                SUM(IF(kind='actual',   demand_units,   NULL)) AS fact,
                SUM(IF(kind='actual',   sales_units,    NULL)) AS sales,
                SUM(IF(kind='forecast', forecast_units, NULL)) AS forecast,
-               SUM(IF(kind='forecast', lo_80,          NULL)) AS lo_80,
+               GREATEST(SUM(IF(kind='forecast', lo_80, NULL)), 0) AS lo_80,
                SUM(IF(kind='forecast', hi_80,          NULL)) AS hi_80
         FROM `{DS}.looker_fact_monthly`
         WHERE {' AND '.join(where)}
@@ -274,17 +274,35 @@ def load_plan_compare(groups: tuple) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600)
-def load_on_track(level: str) -> pd.DataFrame:
+def load_on_track(level: str, groups: tuple, categories: tuple) -> pd.DataFrame:
     table = "looker_on_track_category" if level == "category" else "looker_on_track"
     key = "category" if level == "category" else "group_key"
+
+    where: list[str] = []
+    params: list = []
+    if level == "category":
+        if categories:
+            where.append("category IN UNNEST(@cats)")
+            params.append(bigquery.ArrayQueryParameter("cats", "STRING", list(categories)))
+    else:
+        if groups:
+            where.append("group_key IN UNNEST(@groups)")
+            params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+        elif categories:
+            where.append("category IN UNNEST(@cats)")
+            params.append(bigquery.ArrayQueryParameter("cats", "STRING", list(categories)))
+
+    clause = "WHERE " + " AND ".join(where) if where else ""
     return run(
         f"""
         SELECT {key} AS name, on_hand, on_order, available,
                forecast_demand, sold_season_to_date,
                proj_leftover, leftover_ratio, cover_months, status, status_rank
         FROM `{DS}.{table}`
+        {clause}
         ORDER BY status_rank, ABS(proj_leftover) DESC
-        """
+        """,
+        params,
     )
 
 
@@ -335,10 +353,18 @@ def load_gap(groups: tuple) -> pd.DataFrame:
         params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
     return run(
         f"""
-        WITH p AS (
+        WITH scope AS (              -- только месяцы, где есть оба ряда
+          SELECT month
+          FROM `{DS}.looker_plan_compare`
+          WHERE series IN ('Legacy plan', 'Our forecast')
+          GROUP BY month
+          HAVING COUNT(DISTINCT series) = 2
+        ),
+        p AS (
           SELECT group_key, series, SUM(units) AS units
           FROM `{DS}.looker_plan_compare`
-          {where}
+          WHERE month IN (SELECT month FROM scope)
+          {where.replace("WHERE", "AND") if where else ""}
           GROUP BY 1, 2
         )
         SELECT group_key,
@@ -358,8 +384,15 @@ def load_drivers() -> pd.DataFrame:
     """Причины расхождения — из готовой таблицы plan_compare."""
     return run(
         f"""
-        SELECT category, driver_hint,
-               COUNT(*) AS n,
+        SELECT IFNULL(category, 'без категории') AS category,
+               CASE
+                 WHEN driver_hint LIKE 'legacy-only%'  THEN 'была в старом плане, в новый не попала'
+                 WHEN driver_hint LIKE 'new-only%'     THEN 'новая позиция, в старом плане не было'
+                 WHEN driver_hint LIKE 'growth uplift%'   THEN 'рост год к году'
+                 WHEN driver_hint LIKE 'growth decline%'  THEN 'падение год к году'
+                 ELSE 'разница в миксе или поправка на OOS'
+               END AS driver_hint,
+               COUNT(DISTINCT asin) AS n_asins,
                ROUND(SUM(delta_abs)) AS delta_total
         FROM `{DS}.plan_compare`
         WHERE flag = 'REVIEW'
@@ -526,7 +559,12 @@ with tab_over:
             yaxis=dict(gridcolor="#EEF1F4", zeroline=False, title="единиц"),
         )
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("Линия факта обрывается на последнем закрытом месяце. Дальше — модель.")
+        st.caption(
+            "Факт обрывается на последнем закрытом месяце. Дальше — прогноз "
+            "модели ARIMA. Во вкладке «Ввод плана» другой прогноз — по росту "
+            "год к году, он обычно выше; какой из них берём за план, "
+            "решает методология."
+        )
 
         st.markdown("**Продажи и упущенный спрос**")
         st.caption(
@@ -569,7 +607,7 @@ with tab_over:
 with tab_track:
     level = st.radio("Уровень", ["Категории", "Группы"], horizontal=True,
                      label_visibility="collapsed")
-    tr = load_on_track("category" if level == "Категории" else "group")
+    tr = load_on_track("category" if level == "Категории" else "group", g, c)
 
     if tr.empty:
         st.info("Оценка по сезону пока не собрана.")
@@ -714,6 +752,9 @@ with tab_edit:
                     "Пустая «Правка руками» — берётся расчёт системы. "
                     "Ниже — сетка для ввода."
                 )
+
+            grid = df.pivot_table(index=["group_key", "color"], columns="месяц",
+                                  values="план", aggfunc="sum").reset_index()
 
             st.caption("Правьте цифры прямо в таблице. Пусто — считается автоматически.")
             edited = st.data_editor(
@@ -864,10 +905,14 @@ with tab_cmp:
                                  aggfunc="sum")
         palette = {"Fact": FACT, "Our forecast": FCST,
                    "Legacy plan": MUTED, "Our forecast (growth)": "#6A9E5B"}
+        names = {"Fact": "Факт", "Our forecast": "Прогноз (модель)",
+                 "Legacy plan": "Старый план",
+                 "Our forecast (growth)": "Прогноз (по росту)"}
         fig = go.Figure()
         for col_name in piv.columns:
             fig.add_trace(go.Scatter(
-                x=piv.index, y=piv[col_name], mode="lines", name=col_name,
+                x=piv.index, y=piv[col_name], mode="lines",
+                name=names.get(col_name, col_name),
                 line=dict(color=palette.get(col_name, INK), width=2,
                           dash="dot" if "Legacy" in col_name else "solid")))
         fig.update_layout(
@@ -879,13 +924,18 @@ with tab_cmp:
             yaxis=dict(gridcolor="#EEF1F4", zeroline=False, title="единиц"),
         )
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("Legacy plan — старый план из таблиц, для сверки.")
+        st.caption(
+            "Ряды покрывают разные периоды: старый план — с апреля 2026, "
+            "прогноз по росту — с июня 2026, прогноз модели — с сентября 2026. "
+            "Сравнивать их можно только на общих месяцах."
+        )
 
 # ------------------------------------------------------------------ расхождения
 with tab_gap:
     st.caption(
-        "Где наш прогноз расходится со старым планом и почему. "
-        "Смотреть сверху вниз — там самые большие деньги."
+        "Где прогноз расходится со старым планом и почему. Сравнение только "
+        "по месяцам, которые покрыты обоими рядами — иначе разница показывала "
+        "бы разницу периодов, а не планов. Смотреть сверху вниз."
     )
 
     gap = load_gap(g)
@@ -938,7 +988,10 @@ with tab_gap:
         )
 
     st.markdown("**Из-за чего расходимся**")
-    st.caption("Причины по позициям, где разница больше 20%.")
+    st.caption(
+        "Причины по позициям, где разница больше 20%. Считается по парам "
+        "ASIN и месяц, в колонке — число уникальных ASIN."
+    )
     try:
         dr = load_drivers()
         if dr.empty:
@@ -947,7 +1000,7 @@ with tab_gap:
             st.dataframe(
                 dr.rename(columns={
                     "category": "Категория", "driver_hint": "Причина",
-                    "n": "Позиций", "delta_total": "Суммарная разница",
+                    "n_asins": "ASIN", "delta_total": "Суммарная разница",
                 }),
                 hide_index=True, use_container_width=True, height=380,
             )
@@ -956,15 +1009,24 @@ with tab_gap:
 
 # ------------------------------------------------------------------ правки
 with tab_hist:
+    hist_where = ""
+    hist_params: list = []
+    if grps:
+        hist_where = "WHERE group_key IN UNNEST(@groups)"
+        hist_params.append(
+            bigquery.ArrayQueryParameter("groups", "STRING", list(grps)))
+
     hist = run(
         f"""
         SELECT group_key AS `Группа`, color AS `Цвет`, month AS `Месяц`,
                override_units AS `Ручной план`, uplift_pct AS `Аплифт`,
                note AS `Комментарий`, author AS `Автор`, updated_at AS `Когда`
         FROM `{TABLE_OVERRIDE}`
+        {hist_where}
         ORDER BY updated_at DESC
         LIMIT 300
-        """
+        """,
+        hist_params,
     )
     if hist.empty:
         st.info("Ручных правок ещё нет. Первая появится здесь сразу после сохранения.")
