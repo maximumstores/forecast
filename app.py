@@ -601,6 +601,113 @@ def load_config() -> dict:
     return df.iloc[0].to_dict() if not df.empty else {}
 
 
+@st.cache_data(ttl=300)
+def load_target_stock(groups: tuple, months_ahead: int) -> pd.DataFrame:
+    """Целевой остаток рядом с проекцией: видно, дотягиваем или нет."""
+    where = ["p.month >= DATE_TRUNC(CURRENT_DATE(), MONTH)",
+             "p.month < DATE_ADD(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL @ahead MONTH)"]
+    params: list = [bigquery.ScalarQueryParameter("ahead", "INT64", months_ahead)]
+    if groups:
+        where.append("p.group_key IN UNNEST(@groups)")
+        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+
+    return run(
+        f"""
+        WITH proj AS (
+          SELECT p.group_key,
+                 IFNULL(d.color, '') AS color,
+                 p.month,
+                 SUM(p.stock_eom) AS stock_proj
+          FROM `{DS}.psi_projection` p
+          LEFT JOIN (SELECT DISTINCT product_key, color
+                     FROM `{DS}.dim_product`) d USING (product_key)
+          WHERE {' AND '.join(where)}
+          GROUP BY 1, 2, 3
+        )
+        SELECT p.group_key, p.color, p.month,
+               ROUND(p.stock_proj) AS stock_proj,
+               t.target_units, t.author, t.updated_at
+        FROM proj p
+        LEFT JOIN `{DS}.target_stock_latest` t
+          ON t.group_key = p.group_key
+         AND IFNULL(t.color, '') = p.color
+         AND t.month = p.month
+        ORDER BY p.group_key, p.color, p.month
+        """,
+        params,
+    )
+
+
+def save_target_stock(rows: pd.DataFrame, author: str, note: str) -> int:
+    payload = pd.DataFrame({
+        "group_key": rows["group_key"].astype(str),
+        "color": rows["color"].replace("", pd.NA),
+        "month": pd.to_datetime(rows["month"]).dt.date,
+        "target_units": rows["target_units"].astype(float),
+        "note": note or None,
+        "author": author,
+        "updated_at": dt.datetime.now(dt.timezone.utc),
+    })
+    schema = [
+        bigquery.SchemaField("group_key", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("color", "STRING"),
+        bigquery.SchemaField("month", "DATE", mode="REQUIRED"),
+        bigquery.SchemaField("target_units", "FLOAT"),
+        bigquery.SchemaField("note", "STRING"),
+        bigquery.SchemaField("author", "STRING"),
+        bigquery.SchemaField("updated_at", "TIMESTAMP"),
+    ]
+    client.load_table_from_dataframe(
+        payload, f"{PROJECT}.forecast.target_stock",
+        job_config=bigquery.LoadJobConfig(
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            schema=schema),
+    ).result()
+    return len(payload)
+
+
+@st.cache_data(ttl=300)
+def load_curve_override(groups: tuple) -> pd.DataFrame:
+    where = ""
+    params: list = []
+    if groups:
+        where = "WHERE group_key IN UNNEST(@groups)"
+        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+    return run(
+        f"SELECT group_key, size, cal_month, share_pct, author "
+        f"FROM `{DS}.size_curve_latest` {where}",
+        params,
+    )
+
+
+def save_curve_override(rows: pd.DataFrame, author: str, note: str) -> int:
+    payload = pd.DataFrame({
+        "group_key": rows["group_key"].astype(str),
+        "size": rows["size"].astype(str),
+        "cal_month": rows["cal_month"].astype(int),
+        "share_pct": rows["share_pct"].astype(float),
+        "note": note or None,
+        "author": author,
+        "updated_at": dt.datetime.now(dt.timezone.utc),
+    })
+    schema = [
+        bigquery.SchemaField("group_key", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("size", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("cal_month", "INTEGER", mode="REQUIRED"),
+        bigquery.SchemaField("share_pct", "FLOAT"),
+        bigquery.SchemaField("note", "STRING"),
+        bigquery.SchemaField("author", "STRING"),
+        bigquery.SchemaField("updated_at", "TIMESTAMP"),
+    ]
+    client.load_table_from_dataframe(
+        payload, f"{PROJECT}.forecast.size_curve_override",
+        job_config=bigquery.LoadJobConfig(
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            schema=schema),
+    ).result()
+    return len(payload)
+
+
 def save_overrides(rows: pd.DataFrame, author: str, note: str) -> int:
     payload = pd.DataFrame(
         {
@@ -684,10 +791,11 @@ else:
     scope = " · ".join(parts)
 st.caption(f"Данные BigQuery · {scope}")
 
-(tab_alert, tab_over, tab_track, tab_stock, tab_needs, tab_dims,
- tab_edit, tab_curve, tab_cmp, tab_gap, tab_hist) = st.tabs(
-    ["Внимание", "Обзор", "Сезон", "Склад", "Требует плана", "Разрезы",
-     "Ввод плана", "Размерные кривые", "План и факт", "Расхождения", "Правки"]
+(tab_alert, tab_over, tab_track, tab_stock, tab_target, tab_needs,
+ tab_dims, tab_edit, tab_curve, tab_cmp, tab_gap, tab_hist) = st.tabs(
+    ["Внимание", "Обзор", "Сезон", "Склад", "Цель по складу", "Требует плана",
+     "Разрезы", "Ввод плана", "Размерные кривые", "План и факт",
+     "Расхождения", "Правки"]
 )
 
 # ------------------------------------------------------------------ внимание
@@ -1017,6 +1125,104 @@ with tab_stock:
         except Exception as exc:  # noqa: BLE001
             st.caption(f"Список недоступен: {exc}")
 
+# ------------------------------------------------------------------ цель по складу
+with tab_target:
+    tab_intro(
+        "Сколько товара хотим иметь на складе — и сколько будет по расчёту.",
+        "Цель задаётся руками по группе и цвету. Рядом проекция: что получится, "
+        "если ничего не менять. Разница показывает, чего не хватает в заказе."
+    )
+
+    if not grps:
+        st.info("Выберите группу слева — цель задаётся по одной группе за раз.")
+    else:
+        try:
+            tg = load_target_stock(tuple(grps[:5]), months_ahead)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Не удалось прочитать: {exc}")
+            tg = pd.DataFrame()
+
+        if tg.empty:
+            st.info("Проекции по этим группам нет.")
+        else:
+            tg["месяц"] = pd.to_datetime(tg["month"]).dt.strftime("%Y-%m")
+
+            set_cnt = int(tg["target_units"].notna().sum())
+            gap = (tg["target_units"].fillna(0) - tg["stock_proj"]).clip(lower=0).sum()
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Ячеек", len(tg))
+            m2.metric("Цель задана", set_cnt)
+            m3.metric("Не хватит до цели",
+                      f"{gap:,.0f}".replace(",", " "),
+                      help="Сумма недостачи там, где цель выше проекции")
+
+            view_mode = st.radio("Показать", ["Цель", "Проекция", "Разница"],
+                                 horizontal=True, label_visibility="collapsed")
+
+            if view_mode == "Проекция":
+                pv = tg.pivot_table(index=["group_key", "color"], columns="месяц",
+                                    values="stock_proj", aggfunc="sum").reset_index()
+                st.dataframe(pv, hide_index=True, use_container_width=True,
+                             height=440)
+                st.caption("Остаток на конец месяца по текущему плану и приходам.")
+
+            elif view_mode == "Разница":
+                tg["разница"] = tg["target_units"] - tg["stock_proj"]
+                pv = tg.pivot_table(index=["group_key", "color"], columns="месяц",
+                                    values="разница", aggfunc="sum").reset_index()
+                st.dataframe(pv, hide_index=True, use_container_width=True,
+                             height=440)
+                st.caption(
+                    "Плюс — цель выше расчёта, столько не хватает. "
+                    "Минус — товара будет больше цели. Пусто — цель не задана."
+                )
+
+            else:
+                grid_t = tg.pivot_table(index=["group_key", "color"],
+                                        columns="месяц", values="target_units",
+                                        aggfunc="sum").reset_index()
+                for mc in [x for x in grid_t.columns
+                           if x not in ("group_key", "color")]:
+                    grid_t[mc] = pd.to_numeric(grid_t[mc], errors="coerce")
+
+                st.caption("Впишите целевой остаток. Пусто — цель не задана.")
+                ed_t = st.data_editor(
+                    grid_t, hide_index=True, use_container_width=True, height=440,
+                    column_config={
+                        "group_key": st.column_config.TextColumn("Группа", disabled=True),
+                        "color": st.column_config.TextColumn("Цвет", disabled=True),
+                    },
+                    key="target_grid",
+                )
+
+                mcols_t = [x for x in grid_t.columns
+                           if x not in ("group_key", "color")]
+                before_t = grid_t.set_index(["group_key", "color"])[mcols_t]
+                after_t = ed_t.set_index(["group_key", "color"])[mcols_t]
+                diff_t = (after_t != before_t) & after_t.notna()
+
+                changes_t = [
+                    {"group_key": gk, "color": cl, "month": f"{m}-01",
+                     "target_units": after_t.loc[(gk, cl), m]}
+                    for (gk, cl), row in diff_t.iterrows()
+                    for m in mcols_t if row[m]
+                ]
+                changed_t = pd.DataFrame(changes_t)
+
+                a, b = st.columns([3, 1])
+                note_t = a.text_input("Комментарий", key="target_note")
+                b.metric("Изменено", len(changed_t))
+
+                if st.button("Сохранить цель", type="primary",
+                             disabled=changed_t.empty):
+                    try:
+                        n = save_target_stock(changed_t, author, note_t)
+                        st.cache_data.clear()
+                        st.success(f"Сохранено: {n}")
+                        st.rerun()
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"Не сохранилось: {exc}")
+
 # ------------------------------------------------------------------ требует плана
 with tab_needs:
     tab_intro(
@@ -1284,10 +1490,94 @@ with tab_curve:
 
                 st.divider()
 
+            st.divider()
+            st.markdown("**Правка кривой руками**")
             st.caption(
-                "Пока только просмотр. Ручная правка кривых потребует изменений "
-                "в расчёте прогноза — обсудить с Серёжей."
+                "Впишите долю в процентах там, где расчёт не отражает реальность. "
+                "Пусто — берётся расчёт из истории. Доли нормируются "
+                "автоматически, сумма по месяцу приводится к 100%."
             )
+
+            gk_edit = st.selectbox(
+                "Группа для правки",
+                [x for x in cur["group_key"].unique()
+                 if len(cur[cur["group_key"] == x]["size"].unique()) > 1],
+                key="curve_group",
+            )
+
+            if gk_edit:
+                MONTHS_ALL = {1: "янв", 2: "фев", 3: "мар", 4: "апр", 5: "май",
+                              6: "июн", 7: "июл", 8: "авг", 9: "сен", 10: "окт",
+                              11: "ноя", 12: "дек"}
+                sub_e = cur[cur["group_key"] == gk_edit]
+                sizes_e = sorted(sub_e["size"].unique(), key=size_key)
+
+                try:
+                    ovr_c = load_curve_override((gk_edit,))
+                except Exception:  # noqa: BLE001
+                    ovr_c = pd.DataFrame(
+                        columns=["group_key", "size", "cal_month", "share_pct"])
+
+                base = sub_e.pivot_table(index="size", columns="cal_month",
+                                         values="share_pct", aggfunc="sum")
+                base = base.reindex(index=sizes_e, columns=range(1, 13))
+
+                if not ovr_c.empty:
+                    for _, r in ovr_c.iterrows():
+                        if r["size"] in base.index and r["cal_month"] in base.columns:
+                            base.loc[r["size"], r["cal_month"]] = r["share_pct"]
+
+                grid_c = base.round(1).copy()
+                grid_c.columns = [MONTHS_ALL[m] for m in grid_c.columns]
+                grid_c = grid_c.reset_index().rename(columns={"size": "Размер"})
+
+                ed_c = st.data_editor(
+                    grid_c, hide_index=True, use_container_width=True,
+                    column_config={
+                        "Размер": st.column_config.TextColumn(disabled=True),
+                    },
+                    key=f"curve_edit_{gk_edit}",
+                )
+
+                mon_cols = [c for c in grid_c.columns if c != "Размер"]
+                before_c = grid_c.set_index("Размер")[mon_cols]
+                after_c = ed_c.set_index("Размер")[mon_cols]
+                diff_c = (after_c != before_c) & after_c.notna()
+
+                rev = {v: k for k, v in MONTHS_ALL.items()}
+                changes_c = [
+                    {"group_key": gk_edit, "size": sz, "cal_month": rev[mn],
+                     "share_pct": after_c.loc[sz, mn]}
+                    for sz, row in diff_c.iterrows()
+                    for mn in mon_cols if row[mn]
+                ]
+                changed_c = pd.DataFrame(changes_c)
+
+                sums = after_c.sum(axis=0)
+                off = [m for m in mon_cols if abs(sums[m] - 100) > 5]
+                if off:
+                    st.caption(
+                        "Сумма долей заметно отличается от 100% в месяцах: "
+                        + ", ".join(off)
+                        + ". При расчёте доли будут нормированы."
+                    )
+
+                a2, b2 = st.columns([3, 1])
+                note_c = a2.text_input("Комментарий", key="curve_note")
+                b2.metric("Изменено", len(changed_c))
+
+                if st.button("Сохранить кривую", type="primary",
+                             disabled=changed_c.empty):
+                    try:
+                        n = save_curve_override(changed_c, author, note_c)
+                        st.cache_data.clear()
+                        st.success(
+                            f"Сохранено: {n}. В расчёт попадёт после того, как "
+                            "правка будет подключена к прогнозу."
+                        )
+                        st.rerun()
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"Не сохранилось: {exc}")
 
 # ------------------------------------------------------------------ план/факт
 with tab_cmp:
