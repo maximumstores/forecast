@@ -297,7 +297,16 @@ def load_on_track(level: str, groups: tuple, categories: tuple) -> pd.DataFrame:
         f"""
         SELECT {key} AS name, on_hand, on_order, available,
                forecast_demand, sold_season_to_date,
-               proj_leftover, leftover_ratio, cover_months, status, status_rank
+               proj_leftover, leftover_ratio, cover_months,
+               CASE
+                 WHEN status LIKE '%no forecast%'  THEN '⚪ прогноза нет'
+                 WHEN status LIKE '%overstocked%'  THEN '🔴 перезатарены'
+                 WHEN status LIKE '%understocked%' THEN '🔴 не хватит'
+                 WHEN status LIKE '%watch-high%'   THEN '🟡 много запаса'
+                 WHEN status LIKE '%watch-tight%'  THEN '🟡 впритык'
+                 ELSE '🟢 в норме'
+               END AS status,
+               status_rank
         FROM `{DS}.{table}`
         {clause}
         ORDER BY status_rank, ABS(proj_leftover) DESC
@@ -475,6 +484,7 @@ def load_alerts(groups: tuple, categories: tuple) -> pd.DataFrame:
                  3
           FROM `{DS}.looker_on_track`
           WHERE status LIKE '%overstock%' AND proj_leftover > 0 {where_g}
+                AND cover_months > 1
         ),
         noplan AS (                -- позиции без прогноза
           SELECT 'Нужен ручной план', group_key, CAST(NULL AS STRING),
@@ -918,6 +928,9 @@ with tab_edit:
 
             grid = df.pivot_table(index=["group_key", "color"], columns="месяц",
                                   values="план", aggfunc="sum").reset_index()
+            # пустые месяцы показываем прочерком, а не словом None
+            for mc in [x for x in grid.columns if x not in ("group_key", "color")]:
+                grid[mc] = pd.to_numeric(grid[mc], errors="coerce")
 
             st.caption(
                 "Правьте цифры прямо в таблице, потом прокрутите вниз — "
@@ -1147,7 +1160,10 @@ with tab_gap:
         st.caption("Зелёное — планируем больше прежнего, красное — меньше.")
 
         tbl = gap[["group_key", "fact", "legacy", "ours", "growth",
-                   "delta", "delta_pct"]].rename(columns={
+                   "delta", "delta_pct"]].copy()
+        for col in ["fact", "legacy", "ours", "growth", "delta"]:
+            tbl[col] = pd.to_numeric(tbl[col], errors="coerce").round(0)
+        tbl = tbl.rename(columns={
             "group_key": "Группа", "fact": "Факт",
             "legacy": "Старый план", "ours": "Наш прогноз",
             "growth": "Прогноз по росту", "delta": "Разница",
@@ -1156,6 +1172,13 @@ with tab_gap:
         st.dataframe(
             tbl, hide_index=True, use_container_width=True, height=420,
             column_config={
+                "Факт": st.column_config.NumberColumn(
+                    format="%.0f",
+                    help="Пусто — за сравниваемые месяцы факта ещё нет"),
+                "Старый план": st.column_config.NumberColumn(format="%.0f"),
+                "Наш прогноз": st.column_config.NumberColumn(format="%.0f"),
+                "Прогноз по росту": st.column_config.NumberColumn(format="%.0f"),
+                "Разница": st.column_config.NumberColumn(format="%.0f"),
                 "Разница, %": st.column_config.NumberColumn(format="%.0f%%"),
             },
         )
