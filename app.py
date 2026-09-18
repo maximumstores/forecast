@@ -16,6 +16,7 @@ Sales Planner — план продаж и аналитика поверх BigQu
 from __future__ import annotations
 
 import datetime as dt
+import decimal
 import hashlib
 
 import pandas as pd
@@ -130,12 +131,24 @@ def check_auth() -> str:
 author = check_auth()
 
 
+def _to_float(df: pd.DataFrame) -> pd.DataFrame:
+    """BigQuery отдаёт NUMERIC как decimal.Decimal — с float он не
+    складывается. Приводим такие колонки к float сразу после запроса,
+    чтобы арифметика не падала в произвольном месте."""
+    for col in df.columns:
+        if df[col].dtype == "object":
+            sample = df[col].dropna()
+            if not sample.empty and isinstance(sample.iloc[0], decimal.Decimal):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
 def run(sql: str, params: list | None = None) -> pd.DataFrame:
     job = client.query(
         sql,
         job_config=bigquery.QueryJobConfig(query_parameters=params or []),
     )
-    return job.result().to_dataframe()
+    return _to_float(job.result().to_dataframe())
 
 
 # ------------------------------------------------------------------ данные
@@ -1207,15 +1220,22 @@ with tab_stock:
         st.info("По этим фильтрам проекции нет.")
     else:
         stk["month"] = pd.to_datetime(stk["month"])
+        # в проекции бывают пустые значения — приводим к числам,
+        # иначе арифметика по метрикам падает
+        for col in ["stock_start", "incoming", "plan_units",
+                    "stock_end", "stockout_skus"]:
+            stk[col] = pd.to_numeric(stk[col], errors="coerce").fillna(0)
+
         first = stk.iloc[0]
-        total_in = stk["incoming"].sum()
-        total_plan = stk["plan_units"].sum()
-        last_stock = stk.iloc[-1]["stock_end"]
-        lost = first["stock_start"] + total_in - total_plan - last_stock
+        total_in = float(stk["incoming"].sum())
+        total_plan = float(stk["plan_units"].sum())
+        last_stock = float(stk.iloc[-1]["stock_end"])
+        start_stock = float(first["stock_start"])
+        lost = start_stock + total_in - total_plan - last_stock
 
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("На складе сейчас",
-                  f"{first['stock_start']:,.0f}".replace(",", " "))
+                  f"{start_stock:,.0f}".replace(",", " "))
         k2.metric("Придёт за период",
                   f"{total_in:,.0f}".replace(",", " "))
         k3.metric("Уйдёт по плану",
@@ -1227,7 +1247,7 @@ with tab_stock:
         if abs(lost) > max(total_plan * 0.02, 100):
             st.caption(
                 f"Простая арифметика (начало + приход − план) даёт "
-                f"{first['stock_start'] + total_in - total_plan:,.0f}".replace(",", " ")
+                f"{start_stock + total_in - total_plan:,.0f}".replace(",", " ")
                 + f", а по расчёту остаётся {last_stock:,.0f}".replace(",", " ")
                 + ". Разница в том, что остаток считается по каждому SKU "
                 "отдельно и не уходит в минус: на FBA неудовлетворённый спрос "
