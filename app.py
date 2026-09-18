@@ -417,8 +417,18 @@ def load_gap(groups: tuple) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600)
-def load_drivers() -> pd.DataFrame:
+def load_drivers(groups: tuple, categories: tuple) -> pd.DataFrame:
     """Причины расхождения — из готовой таблицы plan_compare."""
+    where = ["flag = 'REVIEW'"]
+    params: list = []
+    if groups:
+        where.append("""asin IN (SELECT asin FROM `""" + DS +
+                     """.dim_product` WHERE group_key IN UNNEST(@groups))""")
+        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+    elif categories:
+        where.append("category IN UNNEST(@cats)")
+        params.append(bigquery.ArrayQueryParameter("cats", "STRING", list(categories)))
+
     return run(
         f"""
         SELECT IFNULL(category, 'без категории') AS category,
@@ -432,11 +442,12 @@ def load_drivers() -> pd.DataFrame:
                COUNT(DISTINCT asin) AS n_asins,
                ROUND(SUM(delta_abs)) AS delta_total
         FROM `{DS}.plan_compare`
-        WHERE flag = 'REVIEW'
+        WHERE {' AND '.join(where)}
         GROUP BY 1, 2
         ORDER BY ABS(SUM(delta_abs)) DESC
         LIMIT 25
-        """
+        """,
+        params,
     )
 
 
@@ -525,7 +536,8 @@ def load_alerts(groups: tuple, categories: tuple) -> pd.DataFrame:
         model_gap AS (             -- две модели расходятся: повод перепроверить
           SELECT 'Модели расходятся' AS kind,
                  a.group_key         AS name,
-                 CAST(NULL AS STRING) AS category,
+                 (SELECT ANY_VALUE(category) FROM `{DS}.dim_product` d
+                  WHERE d.group_key = a.group_key) AS category,
                  CAST(ROUND(a.growth_units - a.arima_units) AS INT64) AS units,
                  CONCAT('по росту ', CAST(ROUND(a.growth_units) AS STRING),
                         ', ARIMA ', CAST(ROUND(a.arima_units) AS STRING)) AS detail,
@@ -885,6 +897,10 @@ with st.sidebar:
     grps = st.multiselect("Группа", sorted(pool["group_key"].dropna().unique()))
     st.markdown("---")
     months_ahead = st.slider("Горизонт плана, месяцев", 3, 18, 12)
+    st.caption(
+        "План рассчитан до мая 2027 — дальше данных нет независимо "
+        "от положения ползунка."
+    )
     st.markdown("---")
     st.caption(f"Вы вошли как **{author}**")
     if st.button("Выйти", use_container_width=True):
@@ -929,10 +945,10 @@ with sec_check:
 # ------------------------------------------------------------------ внимание
 with tab_alert:
     tab_intro(
-        "Что горит прямо сейчас — по всем группам сразу.",
+        "Что горит прямо сейчас.",
         "Сверху то, что требует решения на этой неделе: дефицит, позиции без "
-        "плана, потери от отсутствия товара. Снизу перезатаренные — их "
-        "смотрят перед следующей закупкой."
+        "плана, потери от отсутствия товара. Ниже — расхождение моделей и "
+        "избыток запаса, если он есть. Учитывает фильтры слева."
     )
     try:
         al = load_alerts(g, c)
@@ -1009,7 +1025,10 @@ with tab_over:
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Спрос за 12 мес", f"{fact_12:,.0f}".replace(",", " "))
         k2.metric("Год к году", f"{yoy:+.1f}%" if yoy is not None else "—")
-        k3.metric("Прогноз на 12 мес", f"{fcst_12:,.0f}".replace(",", " "))
+        fcst_n = int(s[s["forecast"].notna()].head(12).shape[0])
+        k3.metric(f"Прогноз, {fcst_n} мес",
+                  f"{fcst_12:,.0f}".replace(",", " "),
+                  help="Столько месяцев покрыто планом")
         k4.metric("Факт по", last_fact.strftime("%b %Y"))
 
         fig = go.Figure()
@@ -1103,7 +1122,14 @@ with tab_track:
     )
     level = st.radio("Уровень", ["Категории", "Группы"], horizontal=True,
                      label_visibility="collapsed")
-    tr = load_on_track("category" if level == "Категории" else "group", g, c)
+    # если выбрана группа, а показываем категории — фильтруем по категориям
+    # этих групп, иначе фильтр молча игнорируется
+    cats_eff = c
+    if level == "Категории" and grps and not cats:
+        cats_eff = tuple(dims[dims["group_key"].isin(grps)]["category"]
+                         .dropna().unique())
+    tr = load_on_track("category" if level == "Категории" else "group",
+                       g, cats_eff)
 
     if tr.empty:
         st.info("Оценка по сезону пока не собрана.")
@@ -1185,6 +1211,7 @@ with tab_stock:
         total_in = stk["incoming"].sum()
         total_plan = stk["plan_units"].sum()
         last_stock = stk.iloc[-1]["stock_end"]
+        lost = first["stock_start"] + total_in - total_plan - last_stock
 
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("На складе сейчас",
@@ -1196,6 +1223,18 @@ with tab_stock:
         k4.metric("Останется в конце",
                   f"{last_stock:,.0f}".replace(",", " "),
                   help="Если близко к нулю — товара впритык")
+
+        if abs(lost) > max(total_plan * 0.02, 100):
+            st.caption(
+                f"Простая арифметика (начало + приход − план) даёт "
+                f"{first['stock_start'] + total_in - total_plan:,.0f}".replace(",", " ")
+                + f", а по расчёту остаётся {last_stock:,.0f}".replace(",", " ")
+                + ". Разница в том, что остаток считается по каждому SKU "
+                "отдельно и не уходит в минус: на FBA неудовлетворённый спрос "
+                "теряется, а не переносится на следующий месяц. "
+                f"Расхождение {abs(lost):,.0f} ед.".replace(",", " ")
+                + " и есть тот самый непроданный из-за дефицита объём."
+            )
 
         fig = go.Figure()
         fig.add_trace(go.Bar(
@@ -1379,15 +1418,27 @@ with tab_target:
                 pv = tg.pivot_table(index=["group_key", "color"], columns="месяц",
                                     values="stock_proj", aggfunc="sum").reset_index()
                 for mc in [x for x in pv.columns if x not in ("group_key", "color")]:
-                    pv[mc] = pd.to_numeric(pv[mc], errors="coerce").round(0)
+                    pv[mc] = pd.to_numeric(pv[mc], errors="coerce").astype("float64")
+                pv = pv.rename(columns={"group_key": "Группа", "color": "Цвет"})
                 st.dataframe(pv, hide_index=True, use_container_width=True,
                              height=440)
                 st.caption("Остаток на конец месяца по текущему плану и приходам.")
 
             elif view_mode == "Разница":
+                # без заданной цели разницы не существует — не показываем ноль
                 tg["разница"] = tg["target_units"] - tg["stock_proj"]
                 pv = tg.pivot_table(index=["group_key", "color"], columns="месяц",
-                                    values="разница", aggfunc="sum").reset_index()
+                                    values="разница", aggfunc="sum",
+                                    dropna=False).reset_index()
+                cnt = tg.pivot_table(index=["group_key", "color"], columns="месяц",
+                                     values="разница", aggfunc="count").reset_index()
+                for mc in [x for x in pv.columns if x not in ("group_key", "color")]:
+                    vals = pd.to_numeric(pv[mc], errors="coerce")
+                    if mc in cnt.columns:
+                        empty = pd.to_numeric(cnt[mc], errors="coerce").fillna(0) == 0
+                        vals = vals.mask(empty)
+                    pv[mc] = vals.astype("float64")
+                pv = pv.rename(columns={"group_key": "Группа", "color": "Цвет"})
                 st.dataframe(pv, hide_index=True, use_container_width=True,
                              height=440)
                 st.caption(
@@ -1571,6 +1622,9 @@ with tab_edit:
             )
 
             if show_all:
+                for c_num in ["fact_ly", "plan_auto", "override_units", "план"]:
+                    df[c_num] = pd.to_numeric(df[c_num],
+                                              errors="coerce").astype("float64")
                 cmp_tbl = df[["group_key", "color", "месяц", "fact_ly",
                               "plan_auto", "override_units", "план"]].rename(
                     columns={
@@ -1640,8 +1694,8 @@ with tab_edit:
 with tab_curve:
     tab_intro(
         "Доля каждого размера внутри группы, по месяцам.",
-        "По этим долям прогноз группы раскладывается на размеры. "
-        "Считается из истории спроса. Пока только просмотр."
+        "По этим долям прогноз группы раскладывается на размеры. Считается "
+        "из истории спроса, внизу можно поправить руками."
     )
 
     if not grps:
@@ -1907,12 +1961,16 @@ with tab_gap:
         st.plotly_chart(fig, use_container_width=True)
         st.caption("Зелёное — планируем больше прежнего, красное — меньше.")
 
-        tbl = gap[["group_key", "fact", "legacy", "ours", "growth",
+        # факта в этих месяцах ещё нет — сравниваются будущие периоды,
+        # колонка была бы пустой во всех строках
+        tbl = gap[["group_key", "legacy", "ours", "growth",
                    "delta", "delta_pct"]].copy()
-        for col in ["fact", "legacy", "ours", "growth", "delta"]:
+        for col in ["legacy", "ours", "growth", "delta"]:
             tbl[col] = pd.to_numeric(tbl[col], errors="coerce").round(0)
+        tbl["delta_pct"] = pd.to_numeric(tbl["delta_pct"],
+                                         errors="coerce").round(1)
         tbl = tbl.rename(columns={
-            "group_key": "Группа", "fact": "Факт",
+            "group_key": "Группа",
             "legacy": "Старый план", "ours": "Наш прогноз",
             "growth": "Прогноз по росту", "delta": "Разница",
             "delta_pct": "Разница, %",
@@ -1920,9 +1978,6 @@ with tab_gap:
         st.dataframe(
             tbl, hide_index=True, use_container_width=True, height=420,
             column_config={
-                "Факт": st.column_config.NumberColumn(
-                    format="%.0f",
-                    help="Пусто — за сравниваемые месяцы факта ещё нет"),
                 "Старый план": st.column_config.NumberColumn(format="%.0f"),
                 "Наш прогноз": st.column_config.NumberColumn(format="%.0f"),
                 "Прогноз по росту": st.column_config.NumberColumn(format="%.0f"),
@@ -1937,7 +1992,7 @@ with tab_gap:
         "ASIN и месяц, в колонке — число уникальных ASIN."
     )
     try:
-        dr = load_drivers()
+        dr = load_drivers(g, c)
         if dr.empty:
             st.caption("Существенных расхождений нет.")
         else:
