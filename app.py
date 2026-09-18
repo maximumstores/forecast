@@ -163,15 +163,36 @@ def load_series(groups: tuple, categories: tuple) -> pd.DataFrame:
 
     return run(
         f"""
-        SELECT month,
-               SUM(IF(kind='actual',   demand_units,   NULL)) AS fact,
-               SUM(IF(kind='actual',   sales_units,    NULL)) AS sales,
-               SUM(IF(kind='forecast', forecast_units, NULL)) AS forecast,
-               GREATEST(SUM(IF(kind='forecast', lo_80, NULL)), 0) AS lo_80,
-               SUM(IF(kind='forecast', hi_80,          NULL)) AS hi_80
-        FROM `{DS}.looker_fact_monthly`
-        WHERE {' AND '.join(where)}
-        GROUP BY month
+        WITH fact AS (
+          SELECT month,
+                 SUM(demand_units) AS fact,
+                 SUM(sales_units)  AS sales
+          FROM `{DS}.looker_fact_monthly`
+          WHERE kind = 'actual' AND {' AND '.join(where)}
+          GROUP BY month
+        ),
+        -- основной прогноз — тот же, на котором строится план
+        plan AS (
+          SELECT month, SUM(plan_units) AS forecast
+          FROM `{DS}.plan_sales`
+          WHERE {' AND '.join(where)}
+          GROUP BY month
+        ),
+        -- ARIMA оставляем для интервала: он считается только там
+        band AS (
+          SELECT month,
+                 GREATEST(SUM(lo_80), 0) AS lo_80,
+                 SUM(hi_80)              AS hi_80,
+                 SUM(forecast_units)     AS arima
+          FROM `{DS}.looker_fact_monthly`
+          WHERE kind = 'forecast' AND {' AND '.join(where)}
+          GROUP BY month
+        )
+        SELECT month, f.fact, f.sales, p.forecast,
+               b.lo_80, b.hi_80, b.arima
+        FROM fact f
+        FULL JOIN plan p USING (month)
+        FULL JOIN band b USING (month)
         ORDER BY month
         """,
         params,
@@ -180,7 +201,7 @@ def load_series(groups: tuple, categories: tuple) -> pd.DataFrame:
 
 @st.cache_data(ttl=600)
 def load_breakdown(dim: str, groups: tuple, categories: tuple) -> pd.DataFrame:
-    where = ["kind = 'forecast'", f"{dim} IS NOT NULL"]
+    where = [f"{dim} IS NOT NULL"]
     params: list = []
     if groups:
         where.append("group_key IN UNNEST(@groups)")
@@ -191,8 +212,8 @@ def load_breakdown(dim: str, groups: tuple, categories: tuple) -> pd.DataFrame:
 
     return run(
         f"""
-        SELECT {dim} AS label, SUM(forecast_units) AS units
-        FROM `{DS}.looker_fact_monthly`
+        SELECT {dim} AS label, SUM(plan_units) AS units
+        FROM `{DS}.plan_sales`
         WHERE {' AND '.join(where)}
         GROUP BY label
         ORDER BY units DESC
@@ -494,6 +515,25 @@ def load_alerts(groups: tuple, categories: tuple) -> pd.DataFrame:
           FROM `{DS}.new_needs_plan`
           {where_plain.replace("category IN", "group_key IN") if "category" in where_plain else where_plain}
         ),
+        model_gap AS (             -- две модели расходятся: повод перепроверить
+          SELECT 'Модели расходятся' AS kind,
+                 a.group_key         AS name,
+                 CAST(NULL AS STRING) AS category,
+                 CAST(ROUND(a.growth_units - a.arima_units) AS INT64) AS units,
+                 CONCAT('по росту ', CAST(ROUND(a.growth_units) AS STRING),
+                        ', ARIMA ', CAST(ROUND(a.arima_units) AS STRING)) AS detail,
+                 2 AS prio
+          FROM (
+            SELECT group_key,
+                   SUM(IF(series = 'Our forecast (growth)', units, 0)) AS growth_units,
+                   SUM(IF(series = 'Our forecast',          units, 0)) AS arima_units
+            FROM `{DS}.looker_plan_compare`
+            GROUP BY group_key
+          ) a
+          WHERE a.arima_units > 1000
+            AND ABS(SAFE_DIVIDE(a.growth_units - a.arima_units, a.arima_units)) > 0.3
+            {where_g.replace("group_key", "a.group_key") if where_g else ""}
+        ),
         oos AS (                   -- теряем продажи из-за отсутствия товара
           SELECT 'Упущены продажи (OOS)', group_key, ANY_VALUE(category),
                  CAST(ROUND(SUM(demand_units - sales_units)) AS INT64),
@@ -511,6 +551,7 @@ def load_alerts(groups: tuple, categories: tuple) -> pd.DataFrame:
         UNION ALL SELECT * FROM overstock
         UNION ALL SELECT * FROM noplan
         UNION ALL SELECT * FROM oos
+        UNION ALL SELECT * FROM model_gap
         ORDER BY prio, ABS(units) DESC
         LIMIT 200
         """,
@@ -708,6 +749,73 @@ def save_curve_override(rows: pd.DataFrame, author: str, note: str) -> int:
     return len(payload)
 
 
+@st.cache_data(ttl=600)
+def load_core_tail(groups: tuple, categories: tuple) -> pd.DataFrame:
+    """Делит ассортимент на ядро и хвост внутри каждой группы и считает
+    риск отдельно. Ядро — цвета, дающие первые 70% плана группы."""
+    where: list[str] = []
+    params: list = []
+    if groups:
+        where.append("ps.group_key IN UNNEST(@groups)")
+        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+    if categories:
+        where.append("ps.category IN UNNEST(@cats)")
+        params.append(bigquery.ArrayQueryParameter("cats", "STRING", list(categories)))
+    clause = "WHERE " + " AND ".join(where) if where else ""
+
+    return run(
+        f"""
+        WITH by_color AS (
+          SELECT ps.group_key,
+                 IFNULL(ps.color, '(нет)') AS color,
+                 SUM(ps.plan_units) AS plan_units
+          FROM `{DS}.plan_sales` ps
+          {clause}
+          GROUP BY 1, 2
+        ),
+        ranked AS (
+          SELECT *,
+                 SUM(plan_units) OVER (PARTITION BY group_key) AS grp_total,
+                 SUM(plan_units) OVER (
+                   PARTITION BY group_key ORDER BY plan_units DESC
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY group_key ORDER BY plan_units DESC) AS rn
+          FROM by_color
+        ),
+        marked AS (
+          SELECT group_key, color, plan_units, grp_total,
+                 -- ядро: цвета до 70% объёма группы, но минимум один
+                 IF(rn = 1 OR (running - plan_units) < grp_total * 0.7,
+                    'ядро', 'хвост') AS part
+          FROM ranked
+        ),
+        risk AS (                    -- какие ячейки уходят в ноль
+          SELECT dp.group_key,
+                 IFNULL(dp.color, '(нет)') AS color,
+                 COUNT(DISTINCT f.product_key) AS skus_total,
+                 COUNT(DISTINCT IF(f.first_stockout_month IS NOT NULL,
+                                   f.product_key, NULL)) AS skus_out,
+                 MIN(f.first_stockout_month) AS first_out
+          FROM `{DS}.psi_first_stockout` f
+          JOIN (SELECT DISTINCT product_key, group_key, color
+                FROM `{DS}.dim_product`) dp USING (product_key)
+          GROUP BY 1, 2
+        )
+        SELECT m.group_key, m.color, m.part,
+               ROUND(m.plan_units) AS plan_units,
+               ROUND(SAFE_DIVIDE(m.plan_units, m.grp_total) * 100, 1) AS share_pct,
+               IFNULL(r.skus_total, 0) AS skus_total,
+               IFNULL(r.skus_out, 0)   AS skus_out,
+               r.first_out
+        FROM marked m
+        LEFT JOIN risk r USING (group_key, color)
+        ORDER BY m.group_key, m.plan_units DESC
+        """,
+        params,
+    )
+
+
 def save_overrides(rows: pd.DataFrame, author: str, note: str) -> int:
     payload = pd.DataFrame(
         {
@@ -791,12 +899,25 @@ else:
     scope = " · ".join(parts)
 st.caption(f"Данные BigQuery · {scope}")
 
-(tab_alert, tab_over, tab_track, tab_stock, tab_target, tab_needs,
- tab_dims, tab_edit, tab_curve, tab_cmp, tab_gap, tab_hist) = st.tabs(
-    ["Внимание", "Обзор", "Сезон", "Склад", "Цель по складу", "Требует плана",
-     "Разрезы", "Ввод плана", "Размерные кривые", "План и факт",
-     "Расхождения", "Правки"]
+sec_act, sec_data, sec_plan, sec_check = st.tabs(
+    ["Что делать", "Данные", "Планирование", "Сверка"]
 )
+
+with sec_act:
+    tab_alert, tab_core, tab_needs = st.tabs(
+        ["Внимание", "Ядро и хвост", "Требует плана"])
+
+with sec_data:
+    tab_over, tab_track, tab_stock, tab_dims = st.tabs(
+        ["Обзор", "Сезон", "Склад", "Разрезы"])
+
+with sec_plan:
+    tab_edit, tab_target, tab_curve = st.tabs(
+        ["Ввод плана", "Цель по складу", "Размерные кривые"])
+
+with sec_check:
+    tab_cmp, tab_gap, tab_hist = st.tabs(
+        ["План и факт", "Расхождения", "Правки"])
 
 # ------------------------------------------------------------------ внимание
 with tab_alert:
@@ -819,6 +940,7 @@ with tab_alert:
             "Не хватит товара": "#B5524A",
             "Нужен ручной план": "#C8752B",
             "Упущены продажи (OOS)": "#C8752B",
+            "Модели расходятся": "#7C8B99",
             "Останется на складе": "#7C8B99",
         }
 
@@ -831,11 +953,14 @@ with tab_alert:
         st.caption(
             "Сверху то, что горит. «Не хватит товара» — доступного меньше "
             "прогноза до конца сезона. «Упущены продажи» — разрыв между "
-            "спросом и продажами за последние три месяца."
+            "спросом и продажами за последние три месяца. «Модели расходятся» — "
+            "растовый прогноз и ARIMA отличаются больше чем на 30%, стоит "
+            "посмотреть группу глазами."
         )
 
         for kind in ["Не хватит товара", "Нужен ручной план",
-                     "Упущены продажи (OOS)", "Останется на складе"]:
+                     "Упущены продажи (OOS)", "Модели расходятся",
+                     "Останется на складе"]:
             part = al[al["kind"] == kind]
             if part.empty:
                 continue
@@ -904,9 +1029,9 @@ with tab_over:
         st.plotly_chart(fig, use_container_width=True)
         st.caption(
             "Факт обрывается на последнем закрытом месяце. Дальше — прогноз "
-            "модели ARIMA. Во вкладке «Ввод плана» другой прогноз — по росту "
-            "год к году, он обычно выше; какой из них берём за план, "
-            "решает методология."
+            "по росту год к году: тот же, на котором строится план и заказ. "
+            "Интервал показывает разброс модели ARIMA, она считается "
+            "параллельно и служит для сверки (см. «План и факт»)."
         )
 
         st.markdown("**Продажи и упущенный спрос**")
@@ -1125,6 +1250,90 @@ with tab_stock:
         except Exception as exc:  # noqa: BLE001
             st.caption(f"Список недоступен: {exc}")
 
+# ------------------------------------------------------------------ ядро и хвост
+with tab_core:
+    tab_intro(
+        "Основные цвета против остальных — где на самом деле теряются деньги.",
+        "По чёрному и серому запас обычно есть, а мелкие цвета и крайние "
+        "размеры уходят в ноль. В штуках склад выглядит нормально, "
+        "а половина ассортимента при этом недоступна покупателю."
+    )
+
+    try:
+        ct = load_core_tail(g, c)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Не удалось посчитать: {exc}")
+        ct = pd.DataFrame()
+
+    if ct.empty:
+        st.info("По этим фильтрам данных нет.")
+    else:
+        agg = ct.groupby("part").agg(
+            colors=("color", "count"),
+            plan=("plan_units", "sum"),
+            skus=("skus_total", "sum"),
+            out=("skus_out", "sum"),
+        ).reindex(["ядро", "хвост"]).fillna(0)
+
+        cols = st.columns(2)
+        for col, part in zip(cols, ["ядро", "хвост"]):
+            row = agg.loc[part]
+            risk_pct = (row["out"] / row["skus"] * 100) if row["skus"] else 0
+            with col:
+                st.markdown(
+                    f"**{part.capitalize()}** · {int(row['colors'])} цветов"
+                )
+                a, b = st.columns(2)
+                a.metric("План, ед.",
+                         f"{row['plan']:,.0f}".replace(",", " "))
+                b.metric("SKU в риске",
+                         f"{int(row['out'])} из {int(row['skus'])}",
+                         f"{risk_pct:.0f}%",
+                         delta_color="inverse")
+
+        core_risk = (agg.loc["ядро", "out"] / agg.loc["ядро", "skus"] * 100
+                     if agg.loc["ядро", "skus"] else 0)
+        tail_risk = (agg.loc["хвост", "out"] / agg.loc["хвост", "skus"] * 100
+                     if agg.loc["хвост", "skus"] else 0)
+
+        if tail_risk > core_risk * 1.3 and agg.loc["хвост", "skus"] > 0:
+            st.warning(
+                f"В хвосте {tail_risk:.0f}% позиций уйдут в ноль против "
+                f"{core_risk:.0f}% в ядре. Это та самая потеря на мелких "
+                f"цветах: объём плана небольшой, но каждая недоступная "
+                f"позиция — это ещё и просмотры, которые уходят конкурентам."
+            )
+        elif core_risk > tail_risk:
+            st.info(
+                f"Риск выше в ядре ({core_risk:.0f}% против {tail_risk:.0f}%). "
+                "Необычная ситуация — стоит проверить поставки по основным цветам."
+            )
+
+        st.markdown("**По цветам**")
+        show = ct.copy()
+        show["Риск"] = show.apply(
+            lambda r: f"{r['skus_out']} из {r['skus_total']}"
+            if r["skus_total"] else "—", axis=1)
+        show["first_out"] = pd.to_datetime(
+            show["first_out"], errors="coerce").dt.strftime("%Y-%m")
+        show = show[["group_key", "color", "part", "plan_units", "share_pct",
+                     "Риск", "first_out"]].rename(columns={
+            "group_key": "Группа", "color": "Цвет", "part": "Часть",
+            "plan_units": "План", "share_pct": "Доля, %",
+            "first_out": "Первый стокаут",
+        })
+        st.dataframe(
+            show, hide_index=True, use_container_width=True, height=500,
+            column_config={
+                "План": st.column_config.NumberColumn(format="%.0f"),
+                "Доля, %": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+        st.caption(
+            "Ядро — цвета, дающие первые 70% плана группы. Остальное хвост. "
+            "«Риск» — сколько SKU этого цвета уходят в ноль на горизонте плана."
+        )
+
 # ------------------------------------------------------------------ цель по складу
 with tab_target:
     tab_intro(
@@ -1191,20 +1400,28 @@ with tab_target:
                                        columns="месяц", values="target_units",
                                        aggfunc="count").reset_index()
                 for mc in months_t:
-                    grid_t[mc] = pd.to_numeric(grid_t[mc], errors="coerce")
+                    vals = pd.to_numeric(grid_t[mc], errors="coerce")
                     if mc in has_t.columns:
-                        mask = has_t.set_index(["group_key", "color"])[mc].fillna(0) == 0
+                        cnt = has_t.set_index(["group_key", "color"])[mc]
                         idx = grid_t.set_index(["group_key", "color"]).index
-                        grid_t.loc[[bool(mask.get(i, True)) for i in idx], mc] = pd.NA
+                        empty = [float(cnt.get(i, 0) or 0) == 0 for i in idx]
+                        vals = vals.mask(pd.Series(empty, index=vals.index))
+                    # float64 с NaN — Streamlit рисует пустую ячейку,
+                    # в отличие от Int64/object, где появляется None
+                    grid_t[mc] = vals.astype("float64")
 
                 st.caption("Впишите целевой остаток. Пусто — цель не задана.")
+                col_cfg_t = {
+                    "group_key": st.column_config.TextColumn("Группа", disabled=True),
+                    "color": st.column_config.TextColumn("Цвет", disabled=True),
+                }
+                for mc in months_t:
+                    col_cfg_t[mc] = st.column_config.NumberColumn(
+                        mc, format="%.0f", min_value=0, step=1)
+
                 ed_t = st.data_editor(
                     grid_t, hide_index=True, use_container_width=True, height=440,
-                    column_config={
-                        "group_key": st.column_config.TextColumn("Группа", disabled=True),
-                        "color": st.column_config.TextColumn("Цвет", disabled=True),
-                    },
-                    key="target_grid",
+                    column_config=col_cfg_t, key="target_grid",
                 )
 
                 mcols_t = [x for x in grid_t.columns
@@ -1261,9 +1478,10 @@ with tab_needs:
 # ------------------------------------------------------------------ разрезы
 with tab_dims:
     tab_intro(
-        "Из чего складывается прогноз: размеры, цвета, категории, ABCD.",
+        "Из чего складывается план: размеры, цвета, категории, ABCD.",
         "Смотреть, чтобы понять структуру спроса — например, какая доля "
-        "приходится на чёрный или на размер L."
+        "приходится на чёрный или на размер L. Цифры те же, что во "
+        "«Вводе плана»."
     )
     col1, col2 = st.columns(2)
     targets = [
@@ -1362,23 +1580,28 @@ with tab_edit:
 
             grid = df.pivot_table(index=["group_key", "color"], columns="месяц",
                                   values="план", aggfunc="sum").reset_index()
-            # пустые месяцы показываем прочерком, а не словом None
-            for mc in [x for x in grid.columns if x not in ("group_key", "color")]:
-                grid[mc] = pd.to_numeric(grid[mc], errors="coerce")
+            # float64 с NaN рисуется пустой ячейкой, а не словом None
+            month_cols = [x for x in grid.columns if x not in ("group_key", "color")]
+            for mc in month_cols:
+                grid[mc] = pd.to_numeric(grid[mc], errors="coerce").astype("float64")
 
             st.caption(
                 "Правьте цифры прямо в таблице, потом прокрутите вниз — "
                 "под таблицей кнопка сохранения."
             )
+            col_cfg = {
+                "group_key": st.column_config.TextColumn("Группа", disabled=True,
+                                                         width="medium"),
+                "color": st.column_config.TextColumn("Цвет", disabled=True,
+                                                     width="medium"),
+            }
+            for mc in month_cols:
+                col_cfg[mc] = st.column_config.NumberColumn(
+                    mc, format="%.0f", min_value=0, step=1)
+
             edited = st.data_editor(
                 grid, hide_index=True, use_container_width=True, height=480,
-                column_config={
-                    "group_key": st.column_config.TextColumn("Группа", disabled=True,
-                                                             width="medium"),
-                    "color": st.column_config.TextColumn("Цвет", disabled=True,
-                                                         width="medium"),
-                },
-                key="grid",
+                column_config=col_cfg, key="grid",
             )
 
             mcols = [x for x in grid.columns if x not in ("group_key", "color")]
