@@ -504,57 +504,66 @@ def load_size_curve(groups: tuple) -> pd.DataFrame:
 @st.cache_data(ttl=600)
 def load_alerts(groups: tuple, categories: tuple) -> pd.DataFrame:
     """Собирает проблемы из готовых gold-таблиц в один список.
-    Каждая строка: что случилось, по какой позиции, на сколько единиц."""
-    where_g = ""
+    Категория берётся из справочника — в источниках её может не быть."""
     params: list = []
     if groups:
-        where_g = "AND group_key IN UNNEST(@groups)"
+        flt = "g.group_key IN UNNEST(@groups)"
         params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
     elif categories:
-        where_g = "AND category IN UNNEST(@cats)"
+        flt = "g.category IN UNNEST(@cats)"
         params.append(bigquery.ArrayQueryParameter("cats", "STRING", list(categories)))
-
-    where_plain = where_g.replace("AND ", "WHERE ", 1) if where_g else ""
+    else:
+        flt = "TRUE"
 
     return run(
         f"""
-        WITH stockout AS (          -- не хватит товара до конца сезона
-          SELECT 'Не хватит товара'                       AS kind,
-                 group_key                                AS name,
-                 category,
-                 CAST(ROUND(-proj_leftover) AS INT64)     AS units,
-                 CONCAT('доступно ', CAST(ROUND(available) AS STRING),
-                        ', спрос ', CAST(ROUND(forecast_demand) AS STRING))  AS detail,
+        WITH grp AS (                -- группа и её категория, один источник
+          SELECT DISTINCT group_key, category
+          FROM `{DS}.dim_product`
+          WHERE group_key IS NOT NULL
+        ),
+        stockout AS (                -- не хватит товара до конца сезона
+          SELECT 'Не хватит товара' AS kind,
+                 t.group_key        AS name,
+                 g.category,
+                 CAST(ROUND(-t.proj_leftover) AS INT64) AS units,
+                 CONCAT('доступно ', CAST(ROUND(t.available) AS STRING),
+                        ', спрос ', CAST(ROUND(t.forecast_demand) AS STRING)) AS detail,
                  1 AS prio
-          FROM `{DS}.looker_on_track`
-          WHERE proj_leftover < 0 AND forecast_demand > 0 {where_g}
+          FROM `{DS}.looker_on_track` t
+          JOIN grp g USING (group_key)
+          WHERE t.proj_leftover < 0 AND t.forecast_demand > 0 AND {flt}
         ),
-        overstock AS (             -- останется много после сезона
-          SELECT 'Останется на складе', group_key, category,
-                 CAST(ROUND(proj_leftover) AS INT64),
-                 CONCAT('покрытие ', CAST(ROUND(cover_months, 1) AS STRING), ' мес'),
-                 3
-          FROM `{DS}.looker_on_track`
-          WHERE status LIKE '%overstock%' AND proj_leftover > 0 {where_g}
-                AND cover_months > 1
-        ),
-        noplan AS (                -- позиции без прогноза
-          SELECT 'Нужен ручной план', group_key, CAST(NULL AS STRING),
-                 CAST(ROUND(IFNULL(order_us, 0)) AS INT64),
-                 CONCAT(IFNULL(color, ''), ' ', IFNULL(size, '')),
+        noplan AS (                  -- позиции без прогноза
+          SELECT 'Нужен ручной план', n.group_key, g.category,
+                 CAST(ROUND(IFNULL(n.order_us, 0)) AS INT64),
+                 CONCAT(IFNULL(n.color, ''), ' ', IFNULL(n.size, '')),
                  2
-          FROM `{DS}.new_needs_plan`
-          {where_plain.replace("category IN", "group_key IN") if "category" in where_plain else where_plain}
+          FROM `{DS}.new_needs_plan` n
+          JOIN grp g USING (group_key)
+          WHERE {flt}
         ),
-        model_gap AS (             -- две модели расходятся: повод перепроверить
-          SELECT 'Модели расходятся' AS kind,
-                 a.group_key         AS name,
-                 (SELECT ANY_VALUE(category) FROM `{DS}.dim_product` d
-                  WHERE d.group_key = a.group_key) AS category,
-                 CAST(ROUND(a.growth_units - a.arima_units) AS INT64) AS units,
+        oos AS (                     -- теряем продажи из-за дефицита
+          SELECT 'Упущены продажи (OOS)', f.group_key, ANY_VALUE(g.category),
+                 CAST(ROUND(SUM(f.demand_units - f.sales_units)) AS INT64),
+                 CONCAT('за 3 мес, дней без остатка ',
+                        CAST(ROUND(AVG(f.oos_days)) AS STRING)),
+                 2
+          FROM `{DS}.looker_fact_monthly` f
+          JOIN grp g USING (group_key)
+          WHERE f.kind = 'actual'
+            AND f.month >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 3 MONTH)
+            AND f.demand_units > f.sales_units
+            AND {flt}
+          GROUP BY f.group_key
+          HAVING SUM(f.demand_units - f.sales_units) > 100
+        ),
+        model_gap AS (               -- модели расходятся: повод перепроверить
+          SELECT 'Модели расходятся', a.group_key, g.category,
+                 CAST(ROUND(a.growth_units - a.arima_units) AS INT64),
                  CONCAT('по росту ', CAST(ROUND(a.growth_units) AS STRING),
-                        ', ARIMA ', CAST(ROUND(a.arima_units) AS STRING)) AS detail,
-                 2 AS prio
+                        ', ARIMA ', CAST(ROUND(a.arima_units) AS STRING)),
+                 2
           FROM (
             SELECT group_key,
                    SUM(IF(series = 'Our forecast (growth)', units, 0)) AS growth_units,
@@ -562,223 +571,31 @@ def load_alerts(groups: tuple, categories: tuple) -> pd.DataFrame:
             FROM `{DS}.looker_plan_compare`
             GROUP BY group_key
           ) a
+          JOIN grp g USING (group_key)
           WHERE a.arima_units > 1000
             AND ABS(SAFE_DIVIDE(a.growth_units - a.arima_units, a.arima_units)) > 0.3
-            {where_g.replace("group_key", "a.group_key") if where_g else ""}
+            AND {flt}
         ),
-        oos AS (                   -- теряем продажи из-за отсутствия товара
-          SELECT 'Упущены продажи (OOS)', group_key, ANY_VALUE(category),
-                 CAST(ROUND(SUM(demand_units - sales_units)) AS INT64),
-                 CONCAT('за 3 мес, дней без остатка ',
-                        CAST(ROUND(AVG(oos_days)) AS STRING)),
-                 2
-          FROM `{DS}.looker_fact_monthly`
-          WHERE kind = 'actual'
-            AND month >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 3 MONTH)
-            AND demand_units > sales_units {where_g}
-          GROUP BY group_key
-          HAVING SUM(demand_units - sales_units) > 100
+        overstock AS (               -- останется много после сезона
+          SELECT 'Останется на складе', t.group_key, g.category,
+                 CAST(ROUND(t.proj_leftover) AS INT64),
+                 CONCAT('покрытие ', CAST(ROUND(t.cover_months, 1) AS STRING), ' мес'),
+                 3
+          FROM `{DS}.looker_on_track` t
+          JOIN grp g USING (group_key)
+          WHERE t.status LIKE '%overstock%' AND t.proj_leftover > 0
+            AND t.cover_months > 1 AND {flt}
         )
         SELECT * FROM stockout
-        UNION ALL SELECT * FROM overstock
         UNION ALL SELECT * FROM noplan
         UNION ALL SELECT * FROM oos
         UNION ALL SELECT * FROM model_gap
+        UNION ALL SELECT * FROM overstock
         ORDER BY prio, ABS(units) DESC
         LIMIT 200
         """,
         params,
     )
-
-
-@st.cache_data(ttl=600)
-def load_stock(groups: tuple, categories: tuple) -> pd.DataFrame:
-    """Остатки и движение по месяцам: что на складе, что приедет,
-    сколько спланировано и что останется."""
-    where: list[str] = []
-    params: list = []
-    if groups:
-        where.append("p.group_key IN UNNEST(@groups)")
-        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
-    elif categories:
-        where.append("d.category IN UNNEST(@cats)")
-        params.append(bigquery.ArrayQueryParameter("cats", "STRING", list(categories)))
-    clause = "WHERE " + " AND ".join(where) if where else ""
-
-    return run(
-        f"""
-        SELECT p.month,
-               SUM(p.stock_bom)   AS stock_start,
-               SUM(p.incoming)    AS incoming,
-               SUM(p.plan_units)  AS plan_units,
-               SUM(p.stock_eom)   AS stock_end,
-               COUNTIF(p.is_stockout) AS stockout_skus
-        FROM `{DS}.psi_projection` p
-        LEFT JOIN (SELECT DISTINCT group_key, category
-                   FROM `{DS}.dim_product` WHERE group_key IS NOT NULL) d
-          ON d.group_key = p.group_key
-        {clause}
-        GROUP BY p.month
-        ORDER BY p.month
-        """,
-        params,
-    )
-
-
-@st.cache_data(ttl=600)
-def load_stockouts(groups: tuple, categories: tuple) -> pd.DataFrame:
-    """Позиции, которые кончатся раньше всего."""
-    where: list[str] = ["f.first_stockout_month IS NOT NULL"]
-    params: list = []
-    if groups:
-        where.append("f.group_key IN UNNEST(@groups)")
-        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
-    elif categories:
-        where.append("d.category IN UNNEST(@cats)")
-        params.append(bigquery.ArrayQueryParameter("cats", "STRING", list(categories)))
-
-    return run(
-        f"""
-        SELECT f.group_key, f.asin, f.first_stockout_month,
-               d.category,
-               ROUND(SUM(p.plan_units)) AS plan_after
-        FROM `{DS}.psi_first_stockout` f
-        LEFT JOIN (SELECT DISTINCT group_key, category
-                   FROM `{DS}.dim_product` WHERE group_key IS NOT NULL) d
-          ON d.group_key = f.group_key
-        LEFT JOIN `{DS}.psi_projection` p
-          ON p.product_key = f.product_key AND p.month >= f.first_stockout_month
-        WHERE {' AND '.join(where)}
-        GROUP BY 1, 2, 3, 4
-        ORDER BY f.first_stockout_month, plan_after DESC
-        LIMIT 100
-        """,
-        params,
-    )
-
-
-@st.cache_data(ttl=3600)
-def load_config() -> dict:
-    """Параметры планирования: границы сезона, lead time, пороги."""
-    df = run(
-        f"""
-        SELECT season_start, season_end, lead_time_months,
-               review_period_months, peak_months,
-               service_level_peak, service_level_offpeak,
-               growth_cap_lo, growth_cap_hi,
-               overstock_red_ratio, understock_red_ratio,
-               moq_default, carton_default
-        FROM `{DS}.config` LIMIT 1
-        """
-    )
-    return df.iloc[0].to_dict() if not df.empty else {}
-
-
-@st.cache_data(ttl=300)
-def load_target_stock(groups: tuple, months_ahead: int) -> pd.DataFrame:
-    """Целевой остаток рядом с проекцией: видно, дотягиваем или нет."""
-    where = ["p.month >= DATE_TRUNC(CURRENT_DATE(), MONTH)",
-             "p.month < DATE_ADD(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL @ahead MONTH)"]
-    params: list = [bigquery.ScalarQueryParameter("ahead", "INT64", months_ahead)]
-    if groups:
-        where.append("p.group_key IN UNNEST(@groups)")
-        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
-
-    return run(
-        f"""
-        WITH proj AS (
-          SELECT p.group_key,
-                 IFNULL(d.color, '') AS color,
-                 p.month,
-                 SUM(p.stock_eom) AS stock_proj
-          FROM `{DS}.psi_projection` p
-          LEFT JOIN (SELECT DISTINCT product_key, color
-                     FROM `{DS}.dim_product`) d USING (product_key)
-          WHERE {' AND '.join(where)}
-          GROUP BY 1, 2, 3
-        )
-        SELECT p.group_key, p.color, p.month,
-               ROUND(p.stock_proj) AS stock_proj,
-               t.target_units, t.author, t.updated_at
-        FROM proj p
-        LEFT JOIN `{DS}.target_stock_latest` t
-          ON t.group_key = p.group_key
-         AND IFNULL(t.color, '') = p.color
-         AND t.month = p.month
-        ORDER BY p.group_key, p.color, p.month
-        """,
-        params,
-    )
-
-
-def save_target_stock(rows: pd.DataFrame, author: str, note: str) -> int:
-    payload = pd.DataFrame({
-        "group_key": rows["group_key"].astype(str),
-        "color": rows["color"].replace("", pd.NA),
-        "month": pd.to_datetime(rows["month"]).dt.date,
-        "target_units": rows["target_units"].astype(float),
-        "note": note or None,
-        "author": author,
-        "updated_at": dt.datetime.now(dt.timezone.utc),
-    })
-    schema = [
-        bigquery.SchemaField("group_key", "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("color", "STRING"),
-        bigquery.SchemaField("month", "DATE", mode="REQUIRED"),
-        bigquery.SchemaField("target_units", "FLOAT"),
-        bigquery.SchemaField("note", "STRING"),
-        bigquery.SchemaField("author", "STRING"),
-        bigquery.SchemaField("updated_at", "TIMESTAMP"),
-    ]
-    client.load_table_from_dataframe(
-        payload, f"{PROJECT}.forecast.target_stock",
-        job_config=bigquery.LoadJobConfig(
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-            schema=schema),
-    ).result()
-    return len(payload)
-
-
-@st.cache_data(ttl=300)
-def load_curve_override(groups: tuple) -> pd.DataFrame:
-    where = ""
-    params: list = []
-    if groups:
-        where = "WHERE group_key IN UNNEST(@groups)"
-        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
-    return run(
-        f"SELECT group_key, size, cal_month, share_pct, author "
-        f"FROM `{DS}.size_curve_latest` {where}",
-        params,
-    )
-
-
-def save_curve_override(rows: pd.DataFrame, author: str, note: str) -> int:
-    payload = pd.DataFrame({
-        "group_key": rows["group_key"].astype(str),
-        "size": rows["size"].astype(str),
-        "cal_month": rows["cal_month"].astype(int),
-        "share_pct": rows["share_pct"].astype(float),
-        "note": note or None,
-        "author": author,
-        "updated_at": dt.datetime.now(dt.timezone.utc),
-    })
-    schema = [
-        bigquery.SchemaField("group_key", "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("size", "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("cal_month", "INTEGER", mode="REQUIRED"),
-        bigquery.SchemaField("share_pct", "FLOAT"),
-        bigquery.SchemaField("note", "STRING"),
-        bigquery.SchemaField("author", "STRING"),
-        bigquery.SchemaField("updated_at", "TIMESTAMP"),
-    ]
-    client.load_table_from_dataframe(
-        payload, f"{PROJECT}.forecast.size_curve_override",
-        job_config=bigquery.LoadJobConfig(
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-            schema=schema),
-    ).result()
-    return len(payload)
 
 
 @st.cache_data(ttl=600)
@@ -2055,4 +1872,4 @@ with tab_hist:
     if hist.empty:
         st.info("Ручных правок ещё нет. Первая появится здесь сразу после сохранения.")
     else:
-        st.dataframe(hist, hide_index=True, use_container_width=True)
+        st.dataframe(hist, hide_index=True, use_container_width=True) 
