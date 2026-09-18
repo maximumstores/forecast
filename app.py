@@ -665,6 +665,196 @@ def load_core_tail(groups: tuple, categories: tuple) -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=3600)
+def load_config() -> dict:
+    """Параметры планирования: границы сезона, lead time, пороги."""
+    df = run(
+        f"""
+        SELECT season_start, season_end, lead_time_months,
+               review_period_months, peak_months,
+               service_level_peak, service_level_offpeak,
+               growth_cap_lo, growth_cap_hi,
+               overstock_red_ratio, understock_red_ratio,
+               moq_default, carton_default
+        FROM `{DS}.config` LIMIT 1
+        """
+    )
+    return df.iloc[0].to_dict() if not df.empty else {}
+
+
+@st.cache_data(ttl=600)
+def load_stock(groups: tuple, categories: tuple) -> pd.DataFrame:
+    """Остатки и движение по месяцам: что на складе, что приедет,
+    сколько спланировано и что останется."""
+    where: list[str] = []
+    params: list = []
+    if groups:
+        where.append("p.group_key IN UNNEST(@groups)")
+        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+    elif categories:
+        where.append("d.category IN UNNEST(@cats)")
+        params.append(bigquery.ArrayQueryParameter("cats", "STRING", list(categories)))
+    clause = "WHERE " + " AND ".join(where) if where else ""
+
+    return run(
+        f"""
+        SELECT p.month,
+               SUM(p.stock_bom)   AS stock_start,
+               SUM(p.incoming)    AS incoming,
+               SUM(p.plan_units)  AS plan_units,
+               SUM(p.stock_eom)   AS stock_end,
+               COUNTIF(p.is_stockout) AS stockout_skus
+        FROM `{DS}.psi_projection` p
+        LEFT JOIN (SELECT DISTINCT group_key, category
+                   FROM `{DS}.dim_product` WHERE group_key IS NOT NULL) d
+          ON d.group_key = p.group_key
+        {clause}
+        GROUP BY p.month
+        ORDER BY p.month
+        """,
+        params,
+    )
+
+
+@st.cache_data(ttl=600)
+def load_stockouts(groups: tuple, categories: tuple) -> pd.DataFrame:
+    """Позиции, которые кончатся раньше всего."""
+    where: list[str] = ["f.first_stockout_month IS NOT NULL"]
+    params: list = []
+    if groups:
+        where.append("f.group_key IN UNNEST(@groups)")
+        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+    elif categories:
+        where.append("d.category IN UNNEST(@cats)")
+        params.append(bigquery.ArrayQueryParameter("cats", "STRING", list(categories)))
+
+    return run(
+        f"""
+        SELECT f.group_key, f.asin, f.first_stockout_month,
+               d.category,
+               ROUND(SUM(p.plan_units)) AS plan_after
+        FROM `{DS}.psi_first_stockout` f
+        LEFT JOIN (SELECT DISTINCT group_key, category
+                   FROM `{DS}.dim_product` WHERE group_key IS NOT NULL) d
+          ON d.group_key = f.group_key
+        LEFT JOIN `{DS}.psi_projection` p
+          ON p.product_key = f.product_key AND p.month >= f.first_stockout_month
+        WHERE {' AND '.join(where)}
+        GROUP BY 1, 2, 3, 4
+        ORDER BY f.first_stockout_month, plan_after DESC
+        LIMIT 100
+        """,
+        params,
+    )
+
+
+@st.cache_data(ttl=300)
+def load_target_stock(groups: tuple, months_ahead: int) -> pd.DataFrame:
+    """Целевой остаток рядом с проекцией: видно, дотягиваем или нет."""
+    where = ["p.month >= DATE_TRUNC(CURRENT_DATE(), MONTH)",
+             "p.month < DATE_ADD(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL @ahead MONTH)"]
+    params: list = [bigquery.ScalarQueryParameter("ahead", "INT64", months_ahead)]
+    if groups:
+        where.append("p.group_key IN UNNEST(@groups)")
+        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+
+    return run(
+        f"""
+        WITH proj AS (
+          SELECT p.group_key,
+                 IFNULL(d.color, '') AS color,
+                 p.month,
+                 SUM(p.stock_eom) AS stock_proj
+          FROM `{DS}.psi_projection` p
+          LEFT JOIN (SELECT DISTINCT product_key, color
+                     FROM `{DS}.dim_product`) d USING (product_key)
+          WHERE {' AND '.join(where)}
+          GROUP BY 1, 2, 3
+        )
+        SELECT p.group_key, p.color, p.month,
+               ROUND(p.stock_proj) AS stock_proj,
+               t.target_units, t.author, t.updated_at
+        FROM proj p
+        LEFT JOIN `{DS}.target_stock_latest` t
+          ON t.group_key = p.group_key
+         AND IFNULL(t.color, '') = p.color
+         AND t.month = p.month
+        ORDER BY p.group_key, p.color, p.month
+        """,
+        params,
+    )
+
+
+def save_target_stock(rows: pd.DataFrame, author: str, note: str) -> int:
+    payload = pd.DataFrame({
+        "group_key": rows["group_key"].astype(str),
+        "color": rows["color"].replace("", pd.NA),
+        "month": pd.to_datetime(rows["month"]).dt.date,
+        "target_units": rows["target_units"].astype(float),
+        "note": note or None,
+        "author": author,
+        "updated_at": dt.datetime.now(dt.timezone.utc),
+    })
+    schema = [
+        bigquery.SchemaField("group_key", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("color", "STRING"),
+        bigquery.SchemaField("month", "DATE", mode="REQUIRED"),
+        bigquery.SchemaField("target_units", "FLOAT"),
+        bigquery.SchemaField("note", "STRING"),
+        bigquery.SchemaField("author", "STRING"),
+        bigquery.SchemaField("updated_at", "TIMESTAMP"),
+    ]
+    client.load_table_from_dataframe(
+        payload, f"{PROJECT}.forecast.target_stock",
+        job_config=bigquery.LoadJobConfig(
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            schema=schema),
+    ).result()
+    return len(payload)
+
+
+@st.cache_data(ttl=300)
+def load_curve_override(groups: tuple) -> pd.DataFrame:
+    where = ""
+    params: list = []
+    if groups:
+        where = "WHERE group_key IN UNNEST(@groups)"
+        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+    return run(
+        f"SELECT group_key, size, cal_month, share_pct, author "
+        f"FROM `{DS}.size_curve_latest` {where}",
+        params,
+    )
+
+
+def save_curve_override(rows: pd.DataFrame, author: str, note: str) -> int:
+    payload = pd.DataFrame({
+        "group_key": rows["group_key"].astype(str),
+        "size": rows["size"].astype(str),
+        "cal_month": rows["cal_month"].astype(int),
+        "share_pct": rows["share_pct"].astype(float),
+        "note": note or None,
+        "author": author,
+        "updated_at": dt.datetime.now(dt.timezone.utc),
+    })
+    schema = [
+        bigquery.SchemaField("group_key", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("size", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("cal_month", "INTEGER", mode="REQUIRED"),
+        bigquery.SchemaField("share_pct", "FLOAT"),
+        bigquery.SchemaField("note", "STRING"),
+        bigquery.SchemaField("author", "STRING"),
+        bigquery.SchemaField("updated_at", "TIMESTAMP"),
+    ]
+    client.load_table_from_dataframe(
+        payload, f"{PROJECT}.forecast.size_curve_override",
+        job_config=bigquery.LoadJobConfig(
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            schema=schema),
+    ).result()
+    return len(payload)
+
+
 def save_overrides(rows: pd.DataFrame, author: str, note: str) -> int:
     payload = pd.DataFrame(
         {
