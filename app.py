@@ -45,6 +45,13 @@ st.markdown(
     """
     <style>
       .block-container {padding-top: 2.2rem; max-width: 1500px;}
+      @media (max-width: 820px) {
+        .block-container {padding-left: .6rem; padding-right: .6rem;}
+        div[data-testid="stMetricValue"] {font-size: 1.15rem;}
+        div[data-testid="stMetricLabel"] {font-size: .75rem;}
+        button[data-baseweb="tab"] {padding-left: .5rem; padding-right: .5rem;}
+        button[data-baseweb="tab"] p {font-size: .82rem;}
+      }
       div[data-testid="stMetricValue"] {font-size: 1.6rem;}
       div[data-testid="stMetricLabel"] {color: #7C8B99;}
     </style>
@@ -787,7 +794,7 @@ def load_core_tail(groups: tuple, categories: tuple) -> pd.DataFrame:
           SELECT group_key, color, plan_units, grp_total,
                  -- ядро: цвета до 70% объёма группы, но минимум один
                  IF(rn = 1 OR (running - plan_units) < grp_total * 0.7,
-                    'ядро', 'хвост') AS part
+                    'основные', 'прочие') AS part
           FROM ranked
         ),
         risk AS (                    -- какие ячейки уходят в ноль
@@ -905,7 +912,7 @@ sec_act, sec_data, sec_plan, sec_check = st.tabs(
 
 with sec_act:
     tab_alert, tab_core, tab_needs = st.tabs(
-        ["Внимание", "Ядро и хвост", "Требует плана"])
+        ["Внимание", "Основные и прочие", "Требует плана"])
 
 with sec_data:
     tab_over, tab_track, tab_stock, tab_dims = st.tabs(
@@ -1253,7 +1260,7 @@ with tab_stock:
 # ------------------------------------------------------------------ ядро и хвост
 with tab_core:
     tab_intro(
-        "Основные цвета против остальных — где на самом деле теряются деньги.",
+        "Основные цвета против прочих — где на самом деле теряются деньги.",
         "По чёрному и серому запас обычно есть, а мелкие цвета и крайние "
         "размеры уходят в ноль. В штуках склад выглядит нормально, "
         "а половина ассортимента при этом недоступна покупателю."
@@ -1273,10 +1280,10 @@ with tab_core:
             plan=("plan_units", "sum"),
             skus=("skus_total", "sum"),
             out=("skus_out", "sum"),
-        ).reindex(["ядро", "хвост"]).fillna(0)
+        ).reindex(["основные", "прочие"]).fillna(0)
 
         cols = st.columns(2)
-        for col, part in zip(cols, ["ядро", "хвост"]):
+        for col, part in zip(cols, ["основные", "прочие"]):
             row = agg.loc[part]
             risk_pct = (row["out"] / row["skus"] * 100) if row["skus"] else 0
             with col:
@@ -1291,21 +1298,21 @@ with tab_core:
                          f"{risk_pct:.0f}%",
                          delta_color="inverse")
 
-        core_risk = (agg.loc["ядро", "out"] / agg.loc["ядро", "skus"] * 100
-                     if agg.loc["ядро", "skus"] else 0)
-        tail_risk = (agg.loc["хвост", "out"] / agg.loc["хвост", "skus"] * 100
-                     if agg.loc["хвост", "skus"] else 0)
+        core_risk = (agg.loc["основные", "out"] / agg.loc["основные", "skus"] * 100
+                     if agg.loc["основные", "skus"] else 0)
+        tail_risk = (agg.loc["прочие", "out"] / agg.loc["прочие", "skus"] * 100
+                     if agg.loc["прочие", "skus"] else 0)
 
-        if tail_risk > core_risk * 1.3 and agg.loc["хвост", "skus"] > 0:
+        if tail_risk > core_risk * 1.3 and agg.loc["прочие", "skus"] > 0:
             st.warning(
-                f"В хвосте {tail_risk:.0f}% позиций уйдут в ноль против "
-                f"{core_risk:.0f}% в ядре. Это та самая потеря на мелких "
+                f"Среди прочих цветов {tail_risk:.0f}% позиций уйдут в ноль "
+                f"против {core_risk:.0f}% у основных. Это та самая потеря на мелких "
                 f"цветах: объём плана небольшой, но каждая недоступная "
                 f"позиция — это ещё и просмотры, которые уходят конкурентам."
             )
         elif core_risk > tail_risk:
             st.info(
-                f"Риск выше в ядре ({core_risk:.0f}% против {tail_risk:.0f}%). "
+                f"Риск выше у основных цветов ({core_risk:.0f}% против {tail_risk:.0f}%). "
                 "Необычная ситуация — стоит проверить поставки по основным цветам."
             )
 
@@ -1330,7 +1337,7 @@ with tab_core:
             },
         )
         st.caption(
-            "Ядро — цвета, дающие первые 70% плана группы. Остальное хвост. "
+            "Основные — цвета, дающие первые 70% плана группы. Остальные прочие. "
             "«Риск» — сколько SKU этого цвета уходят в ноль на горизонте плана."
         )
 
