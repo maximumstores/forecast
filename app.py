@@ -295,6 +295,28 @@ def load_plan(months_ahead: int, groups: tuple) -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=300)
+def load_plan_editable(groups: tuple) -> pd.DataFrame:
+    """План с учётом ручных правок — то, что реально уйдёт в заказ.
+    Отдельно от looker_plan_compare, потому что тот собирается
+    при пересборке, а правки появляются в течение дня."""
+    where = ""
+    params: list = []
+    if groups:
+        where = "WHERE group_key IN UNNEST(@groups)"
+        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+    return run(
+        f"""
+        SELECT month, SUM(plan_units) AS units
+        FROM `{DS}.plan_sales`
+        {where}
+        GROUP BY month
+        ORDER BY month
+        """,
+        params,
+    )
+
+
 @st.cache_data(ttl=600)
 def load_plan_compare(groups: tuple) -> pd.DataFrame:
     where = ""
@@ -1970,7 +1992,7 @@ with tab_curve:
 # ------------------------------------------------------------------ план/факт
 with tab_cmp:
     tab_intro(
-        "Четыре ряда рядом: факт, старый план, два наших прогноза.",
+        "Пять рядов рядом: факт, старый план, два прогноза и итоговый план.",
         "Нужно, чтобы видеть, насколько новый расчёт отличается от того, "
         "как планировали раньше. Ряды покрывают разные периоды — "
         "сравнивать можно только на общих месяцах."
@@ -1994,6 +2016,18 @@ with tab_cmp:
                 name=names.get(col_name, col_name),
                 line=dict(color=palette.get(col_name, INK), width=2,
                           dash="dot" if "Legacy" in col_name else "solid")))
+
+        # пятый ряд: план, который реально уйдёт в заказ
+        try:
+            ed = load_plan_editable(g)
+            if not ed.empty:
+                ed["month"] = pd.to_datetime(ed["month"])
+                fig.add_trace(go.Scatter(
+                    x=ed["month"], y=ed["units"], mode="lines",
+                    name="План (с правками)",
+                    line=dict(color="#8B5E9C", width=2.5)))
+        except Exception:  # noqa: BLE001
+            pass
         fig.update_layout(
             height=430, margin=dict(l=0, r=0, t=10, b=0),
             plot_bgcolor="white", paper_bgcolor="white", hovermode="x unified",
@@ -2004,9 +2038,13 @@ with tab_cmp:
         )
         st.plotly_chart(fig, use_container_width=True)
         st.caption(
-            "Ряды покрывают разные периоды: старый план — с апреля 2026, "
-            "прогноз по росту — с июня 2026, прогноз модели — с сентября 2026. "
-            "Сравнивать их можно только на общих месяцах."
+            "Пять рядов. «Факт» — что продали. «Старый план» — как "
+            "планировали в таблицах. «Прогноз (модель)» — ARIMA. "
+            "«Прогноз (по росту)» — год к году. «План (с правками)» — "
+            "то, что реально уйдёт в заказ: расчёт плюс ручные правки "
+            "из вкладки «Ввод плана».\n\n"
+            "Ряды покрывают разные периоды, сравнивать корректно только "
+            "на общих месяцах."
         )
 
 # ------------------------------------------------------------------ расхождения
