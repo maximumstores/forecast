@@ -357,6 +357,35 @@ def load_on_track(level: str, groups: tuple, categories: tuple) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600)
+def load_groups_without_plan(groups: tuple, categories: tuple) -> pd.DataFrame:
+    """Группы, которые есть в справочнике, но не попали в план вообще.
+    new_needs_plan ловит только новые SKU, а группа может выпасть целиком."""
+    params: list = []
+    flt = "TRUE"
+    if groups:
+        flt = "d.group_key IN UNNEST(@groups)"
+        params.append(bigquery.ArrayQueryParameter("groups", "STRING", list(groups)))
+    elif categories:
+        flt = "d.category IN UNNEST(@cats)"
+        params.append(bigquery.ArrayQueryParameter("cats", "STRING", list(categories)))
+
+    return run(
+        f"""
+        SELECT d.group_key, ANY_VALUE(d.category) AS category,
+               COUNT(DISTINCT d.asin) AS asins,
+               ROUND(SUM(IFNULL(d.stock_us, 0))) AS stock_us
+        FROM `{DS}.dim_product` d
+        WHERE d.active_us AND d.group_key IS NOT NULL AND {flt}
+          AND d.group_key NOT IN (SELECT DISTINCT group_key FROM `{DS}.plan_sales`)
+        GROUP BY d.group_key
+        ORDER BY stock_us DESC
+        LIMIT 100
+        """,
+        params,
+    )
+
+
+@st.cache_data(ttl=600)
 def load_needs_plan() -> pd.DataFrame:
     return run(
         f"""
@@ -892,6 +921,12 @@ def save_overrides(rows: pd.DataFrame, author: str, note: str) -> int:
     return len(payload)
 
 
+def num(v: float) -> str:
+    """Число с неразрывным пробелом между разрядами. Отдельной функцией,
+    чтобы не делать .replace на строке целиком — так пропадали запятые."""
+    return f"{v:,.0f}".replace(",", "\u202f")
+
+
 def tab_intro(what: str, action: str) -> None:
     """Короткое пояснение в начале вкладки: что показано и что с этим делать."""
     st.markdown(
@@ -1161,8 +1196,12 @@ with tab_track:
         m1.metric("Требуют решения", red)
         m2.metric("Под наблюдением", amber)
         m3.metric("В норме", green)
-        m4.metric("Спрос до конца сезона",
-                  f"{tr['forecast_demand'].sum():,.0f}".replace(",", " "))
+        m4.metric(
+            "Спрос до конца сезона",
+            num(tr["forecast_demand"].sum()),
+            help="Сумма по строкам ниже. В режиме «Категории» это объём всей "
+                 "категории, даже если в фильтре выбрана одна группа.",
+        )
 
         st.caption(
             "Хватит ли товара до конца сезона: на руках плюс в пути минус "
@@ -1252,15 +1291,14 @@ with tab_stock:
                   help="Если близко к нулю — товара впритык")
 
         if abs(lost) > max(total_plan * 0.02, 100):
+            simple = num(start_stock + total_in - total_plan)
             st.caption(
-                f"Простая арифметика (начало + приход − план) даёт "
-                f"{start_stock + total_in - total_plan:,.0f}".replace(",", " ")
-                + f", а по расчёту остаётся {last_stock:,.0f}".replace(",", " ")
-                + ". Разница в том, что остаток считается по каждому SKU "
-                "отдельно и не уходит в минус: на FBA неудовлетворённый спрос "
-                "теряется, а не переносится на следующий месяц. "
-                f"Расхождение {abs(lost):,.0f} ед.".replace(",", " ")
-                + " и есть тот самый непроданный из-за дефицита объём."
+                f"Простая арифметика (начало + приход − план) даёт {simple}, "
+                f"а по расчёту остаётся {num(last_stock)}. Разница в том, что "
+                "остаток считается по каждому SKU отдельно и не уходит в минус: "
+                "на FBA неудовлетворённый спрос теряется, а не переносится на "
+                f"следующий месяц. Расхождение {num(abs(lost))} ед. и есть тот "
+                "самый непроданный из-за дефицита объём."
             )
 
         fig = go.Figure()
@@ -1544,9 +1582,31 @@ with tab_needs:
         "Новая линейка без истории продаж или не проставлен Order US. "
         "План по ним ставится руками — других вариантов нет."
     )
+    try:
+        nogroup = load_groups_without_plan(g, c)
+    except Exception:  # noqa: BLE001
+        nogroup = pd.DataFrame()
+
+    if not nogroup.empty:
+        st.markdown("**Группы без плана целиком**")
+        st.caption(
+            "Модель не дала прогноз по всей группе — обычно нет истории "
+            "продаж или она слишком короткая. План по ним не построится, "
+            "пока не задать вручную."
+        )
+        show_ng = nogroup.rename(columns={
+            "group_key": "Группа", "category": "Категория",
+            "asins": "ASIN", "stock_us": "Остаток",
+        })
+        st.dataframe(show_ng, hide_index=True, use_container_width=True,
+                     height=min(380, 45 + 35 * len(show_ng)))
+        st.divider()
+
     needs = load_needs_plan()
-    if needs.empty:
+    if needs.empty and nogroup.empty:
         st.success("Все позиции получили прогноз. Ручное планирование не требуется.")
+    elif needs.empty:
+        st.caption("Отдельных SKU без прогноза нет — только группы выше.")
     else:
         st.metric("Позиций без прогноза", len(needs))
         st.caption(
@@ -1816,17 +1876,22 @@ with tab_curve:
             st.divider()
             st.markdown("**Правка кривой руками**")
             st.caption(
-                "Впишите долю в процентах там, где расчёт не отражает реальность. "
-                "Пусто — берётся расчёт из истории. Доли нормируются "
-                "автоматически, сумма по месяцу приводится к 100%."
+                "Впишите долю в процентах там, где расчёт не отражает "
+                "реальность. Пусто — берётся расчёт из истории. Доли "
+                "нормируются автоматически, сумма по месяцу приводится к 100%."
             )
 
-            gk_edit = st.selectbox(
-                "Группа для правки",
-                [x for x in cur["group_key"].unique()
-                 if len(cur[cur["group_key"] == x]["size"].unique()) > 1],
-                key="curve_group",
-            )
+            editable_groups = [x for x in cur["group_key"].unique()
+                               if len(cur[cur["group_key"] == x]["size"].unique()) > 1]
+
+            if not editable_groups:
+                st.caption(
+                    "Править нечего: у выбранных групп по одному размеру."
+                )
+                gk_edit = None
+            else:
+                gk_edit = st.selectbox("Группа для правки", editable_groups,
+                                       key="curve_group")
 
             if gk_edit:
                 MONTHS_ALL = {1: "янв", 2: "фев", 3: "мар", 4: "апр", 5: "май",
@@ -2062,4 +2127,4 @@ with tab_hist:
     if hist.empty:
         st.info("Ручных правок ещё нет. Первая появится здесь сразу после сохранения.")
     else:
-        st.dataframe(hist, hide_index=True, use_container_width=True) 
+        st.dataframe(hist, hide_index=True, use_container_width=True)
