@@ -516,9 +516,11 @@ def load_drivers(groups: tuple, categories: tuple) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600)
-def load_size_curve(groups: tuple) -> pd.DataFrame:
-    """Доли размеров внутри группы по календарным месяцам — та же логика,
-    что внутри asin_forecast, но посчитанная отдельно для просмотра."""
+def load_size_curve(groups: tuple, dim: str = "size") -> pd.DataFrame:
+    """Доли размеров или цветов внутри группы по календарным месяцам.
+    Размерная логика — та же, что внутри asin_forecast; цветовая считается
+    так же, но в расчёт прогноза не входит (цвет планируется явно)."""
+    col = "size" if dim == "size" else "color"
     where = ["p.group_key IS NOT NULL", "p.active_us", "NOT p.is_new"]
     params: list = []
     if groups:
@@ -529,7 +531,7 @@ def load_size_curve(groups: tuple) -> pd.DataFrame:
         f"""
         WITH cell_hist AS (
           SELECT p.group_key,
-                 COALESCE(p.size, '(none)')  AS size,
+                 COALESCE(p.{col}, '(none)') AS item,
                  EXTRACT(MONTH FROM d.month) AS cal_month,
                  SUM(d.demand)               AS demand
           FROM `{DS}.fact_demand_raw` d
@@ -540,12 +542,25 @@ def load_size_curve(groups: tuple) -> pd.DataFrame:
         grp AS (
           SELECT group_key, cal_month, SUM(demand) AS g_demand
           FROM cell_hist GROUP BY 1, 2
+        ),
+        grp_year AS (
+          SELECT group_key, SUM(demand) AS y_demand
+          FROM cell_hist GROUP BY 1
+        ),
+        item_year AS (
+          SELECT group_key, item, SUM(demand) AS i_demand
+          FROM cell_hist GROUP BY 1, 2
         )
-        SELECT h.group_key, h.size, h.cal_month,
+        SELECT h.group_key, h.item, h.cal_month,
                ROUND(SAFE_DIVIDE(h.demand, NULLIF(g.g_demand, 0)) * 100, 1) AS share_pct,
-               ROUND(h.demand) AS demand
+               ROUND(h.demand) AS demand,
+               ROUND(SAFE_DIVIDE(iy.i_demand, NULLIF(gy.y_demand, 0)) * 100, 1)
+                 AS share_year_pct,
+               ROUND(iy.i_demand) AS demand_year
         FROM cell_hist h
-        JOIN grp g USING (group_key, cal_month)
+        JOIN grp        g  USING (group_key, cal_month)
+        JOIN item_year  iy USING (group_key, item)
+        JOIN grp_year   gy USING (group_key)
         ORDER BY h.group_key, h.cal_month, share_pct DESC
         """,
         params,
@@ -1822,15 +1837,26 @@ with tab_edit:
 # ------------------------------------------------------------------ кривые
 with tab_curve:
     tab_intro(
-        "Доля каждого размера внутри группы, по месяцам.",
-        "По этим долям прогноз группы раскладывается на размеры. Считается "
-        "из истории спроса, внизу можно поправить руками."
+        "Доли размеров и цветов внутри группы.",
+        "По размерным долям прогноз группы раскладывается на размеры — "
+        "их можно поправить руками внизу. Цветовые доли показаны для "
+        "понимания структуры: цвет планируется явно во «Вводе плана», "
+        "а не выводится из доли."
     )
 
     if not grps:
         st.info("Выберите группу слева — кривые показываются по одной группе.")
     else:
-        cur = load_size_curve(tuple(grps[:3]))
+        c_dim, c_period = st.columns(2)
+        dim_label = c_dim.radio("Разрез", ["Размеры", "Цвета"],
+                                horizontal=True, key="curve_dim")
+        period = c_period.radio("Период", ["По месяцам", "За год"],
+                                horizontal=True, key="curve_period",
+                                help="«За год» — доля за всю историю сразу, "
+                                     "без разбивки по сезонности")
+        dim_key = "size" if dim_label == "Размеры" else "color"
+
+        cur = load_size_curve(tuple(grps[:3]), dim_key)
         if cur.empty:
             st.info("По этим группам истории нет.")
         else:
@@ -1849,49 +1875,95 @@ with tab_curve:
 
             for gk in cur["group_key"].unique():
                 sub = cur[cur["group_key"] == gk]
-                sizes = sorted(sub["size"].unique(), key=size_key)
+                if dim_key == "size":
+                    items = sorted(sub["item"].unique(), key=size_key)
+                else:
+                    # цвета — по убыванию доли, их обычно много
+                    items = (sub.groupby("item")["share_year_pct"].max()
+                             .sort_values(ascending=False).index.tolist())
 
                 st.markdown(f"**{gk}**")
 
-                if len(sizes) < 2:
+                if len(items) < 2:
                     st.caption(
-                        f"У группы один размер ({sizes[0] if sizes else '—'}) — "
-                        "раскладывать нечего, весь прогноз идёт на него."
+                        f"У группы один вариант ({items[0] if items else '—'}) — "
+                        "делить нечего."
                     )
                     st.divider()
                     continue
 
-                piv = sub.pivot_table(index="size", columns="cal_month",
+                # ---------------------------------------------- за год
+                if period == "За год":
+                    year = (sub.groupby("item")
+                            .agg(share=("share_year_pct", "max"),
+                                 demand=("demand_year", "max"))
+                            .reindex(items).reset_index())
+                    year = year[year["share"].notna()]
+
+                    fig = go.Figure(go.Bar(
+                        x=year["share"], y=year["item"], orientation="h",
+                        marker_color=FCST,
+                        hovertemplate="%{y}: %{x:.1f}%<extra></extra>"))
+                    fig.update_layout(
+                        height=max(240, 26 * len(year)),
+                        margin=dict(l=0, r=0, t=6, b=0),
+                        plot_bgcolor="white", paper_bgcolor="white",
+                        font=dict(color=INK, size=12),
+                        xaxis=dict(gridcolor="#EEF1F4", title="доля за всю историю, %"),
+                        yaxis=dict(autorange="reversed"),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    show_y = year.rename(columns={
+                        "item": "Размер" if dim_key == "size" else "Цвет",
+                        "share": "Доля, %", "demand": "Спрос, ед.",
+                    })
+                    st.dataframe(show_y, hide_index=True,
+                                 use_container_width=True,
+                                 column_config={
+                                     "Доля, %": st.column_config.NumberColumn(
+                                         format="%.1f%%"),
+                                 })
+                    st.divider()
+                    continue
+
+                # ---------------------------------------------- по месяцам
+                piv = sub.pivot_table(index="item", columns="cal_month",
                                       values="share_pct", aggfunc="sum")
-                dem = sub.pivot_table(index="size", columns="cal_month",
+                dem = sub.pivot_table(index="item", columns="cal_month",
                                       values="demand", aggfunc="sum")
                 months = sorted(piv.columns)
-                piv = piv.reindex(index=sizes, columns=months)
-                dem = dem.reindex(index=sizes, columns=months)
+                piv = piv.reindex(index=items, columns=months)
+                dem = dem.reindex(index=items, columns=months)
 
-                # месяцы, где у группы вообще не было спроса
                 month_demand = dem.sum(axis=0, min_count=1).fillna(0)
                 dead = [m for m in months if month_demand.get(m, 0) == 0]
                 live = [m for m in months if m not in dead]
 
+                # цветов бывает много — рисуем топ-10, остальное в таблице
+                draw = items[:10] if dim_key == "color" else items
+
                 fig = go.Figure()
-                for size in sizes:
+                for it in draw:
                     fig.add_trace(go.Scatter(
                         x=[MONTHS.get(m, m) for m in live],
-                        y=[piv.loc[size, m] for m in live],
-                        mode="lines+markers", name=str(size), line=dict(width=2),
-                        hovertemplate="%{y:.1f}%<extra>" + str(size) + "</extra>"))
+                        y=[piv.loc[it, m] for m in live],
+                        mode="lines+markers", name=str(it), line=dict(width=2),
+                        hovertemplate="%{y:.1f}%<extra>" + str(it) + "</extra>"))
                 fig.update_layout(
-                    height=320, margin=dict(l=0, r=0, t=6, b=0),
+                    height=340, margin=dict(l=0, r=0, t=6, b=0),
                     plot_bgcolor="white", paper_bgcolor="white",
                     font=dict(color=INK, size=12), hovermode="x unified",
-                    legend=dict(orientation="h", y=1.15, x=0),
+                    legend=dict(orientation="h", y=1.18, x=0),
                     xaxis=dict(showgrid=False, linecolor="#DDE3E8"),
                     yaxis=dict(gridcolor="#EEF1F4", zeroline=False,
                                title="доля, %", rangemode="tozero"),
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
+                if dim_key == "color" and len(items) > 10:
+                    st.caption(f"На графике топ-10 из {len(items)} цветов, "
+                               "остальные в таблице ниже.")
                 if dead:
                     st.caption(
                         "Месяцы без продаж у группы (доля не считается): " +
@@ -1900,13 +1972,15 @@ with tab_curve:
 
                 tbl = piv[live].round(1)
                 tbl.columns = [MONTHS.get(m, m) for m in live]
-                tbl = tbl.reset_index().rename(columns={"size": "Размер"})
+                tbl = tbl.reset_index().rename(columns={
+                    "item": "Размер" if dim_key == "size" else "Цвет"})
                 st.dataframe(tbl, hide_index=True, use_container_width=True)
 
                 with st.expander("Спрос, на котором посчитаны доли"):
                     dtb = dem[live].fillna(0).astype(int)
                     dtb.columns = [MONTHS.get(m, m) for m in live]
-                    dtb = dtb.reset_index().rename(columns={"size": "Размер"})
+                    dtb = dtb.reset_index().rename(columns={
+                        "item": "Размер" if dim_key == "size" else "Цвет"})
                     st.dataframe(dtb, hide_index=True, use_container_width=True)
                     st.caption(
                         "Чем меньше спрос в месяце, тем случайнее доля. "
@@ -1915,99 +1989,103 @@ with tab_curve:
 
                 st.divider()
 
-            editable_groups = [x for x in cur["group_key"].unique()
-                               if len(cur[cur["group_key"] == x]["size"].unique()) > 1]
-
-            st.divider()
-            if not editable_groups:
+            # ------------------------------------------------ редактор
+            if dim_key == "color":
                 st.caption(
-                    "Править нечего: у выбранных групп по одному размеру."
+                    "Цветовые доли правке не подлежат: цвет планируется "
+                    "числом во «Вводе плана», а не долей."
                 )
-                gk_edit = None
             else:
-                st.markdown("**Правка кривой руками**")
-                st.caption(
-                    "Впишите долю в процентах там, где расчёт не отражает "
-                    "реальность. Пусто — берётся расчёт из истории. Доли "
-                    "нормируются автоматически, сумма по месяцу приводится "
-                    "к 100%."
-                )
-                gk_edit = st.selectbox("Группа для правки", editable_groups,
-                                       key="curve_group")
+                editable_groups = [
+                    x for x in cur["group_key"].unique()
+                    if len(cur[cur["group_key"] == x]["item"].unique()) > 1]
 
-            if gk_edit:
-                MONTHS_ALL = {1: "янв", 2: "фев", 3: "мар", 4: "апр", 5: "май",
-                              6: "июн", 7: "июл", 8: "авг", 9: "сен", 10: "окт",
-                              11: "ноя", 12: "дек"}
-                sub_e = cur[cur["group_key"] == gk_edit]
-                sizes_e = sorted(sub_e["size"].unique(), key=size_key)
-
-                try:
-                    ovr_c = load_curve_override((gk_edit,))
-                except Exception:  # noqa: BLE001
-                    ovr_c = pd.DataFrame(
-                        columns=["group_key", "size", "cal_month", "share_pct"])
-
-                base = sub_e.pivot_table(index="size", columns="cal_month",
-                                         values="share_pct", aggfunc="sum")
-                base = base.reindex(index=sizes_e, columns=range(1, 13))
-
-                if not ovr_c.empty:
-                    for _, r in ovr_c.iterrows():
-                        if r["size"] in base.index and r["cal_month"] in base.columns:
-                            base.loc[r["size"], r["cal_month"]] = r["share_pct"]
-
-                grid_c = base.round(1).copy()
-                grid_c.columns = [MONTHS_ALL[m] for m in grid_c.columns]
-                grid_c = grid_c.reset_index().rename(columns={"size": "Размер"})
-
-                ed_c = st.data_editor(
-                    grid_c, hide_index=True, use_container_width=True,
-                    column_config={
-                        "Размер": st.column_config.TextColumn(disabled=True),
-                    },
-                    key=f"curve_edit_{gk_edit}",
-                )
-
-                mon_cols = [c for c in grid_c.columns if c != "Размер"]
-                before_c = grid_c.set_index("Размер")[mon_cols]
-                after_c = ed_c.set_index("Размер")[mon_cols]
-                diff_c = (after_c != before_c) & after_c.notna()
-
-                rev = {v: k for k, v in MONTHS_ALL.items()}
-                changes_c = [
-                    {"group_key": gk_edit, "size": sz, "cal_month": rev[mn],
-                     "share_pct": after_c.loc[sz, mn]}
-                    for sz, row in diff_c.iterrows()
-                    for mn in mon_cols if row[mn]
-                ]
-                changed_c = pd.DataFrame(changes_c)
-
-                sums = after_c.sum(axis=0)
-                off = [m for m in mon_cols if abs(sums[m] - 100) > 5]
-                if off:
+                if not editable_groups:
                     st.caption(
-                        "Сумма долей заметно отличается от 100% в месяцах: "
-                        + ", ".join(off)
-                        + ". При расчёте доли будут нормированы."
+                        "Править нечего: у выбранных групп по одному размеру."
+                    )
+                    gk_edit = None
+                else:
+                    st.markdown("**Правка размерной кривой руками**")
+                    st.caption(
+                        "Впишите долю в процентах там, где расчёт не отражает "
+                        "реальность. Пусто — берётся расчёт из истории. Доли "
+                        "нормируются автоматически, сумма по месяцу приводится "
+                        "к 100%."
+                    )
+                    gk_edit = st.selectbox("Группа для правки", editable_groups,
+                                           key="curve_group")
+
+                if gk_edit:
+                    MONTHS_ALL = MONTHS
+                    sub_e = cur[cur["group_key"] == gk_edit]
+                    sizes_e = sorted(sub_e["item"].unique(), key=size_key)
+
+                    try:
+                        ovr_c = load_curve_override((gk_edit,))
+                    except Exception:  # noqa: BLE001
+                        ovr_c = pd.DataFrame(
+                            columns=["group_key", "size", "cal_month", "share_pct"])
+
+                    base = sub_e.pivot_table(index="item", columns="cal_month",
+                                             values="share_pct", aggfunc="sum")
+                    base = base.reindex(index=sizes_e, columns=range(1, 13))
+
+                    if not ovr_c.empty:
+                        for _, r in ovr_c.iterrows():
+                            if (r["size"] in base.index
+                                    and r["cal_month"] in base.columns):
+                                base.loc[r["size"], r["cal_month"]] = r["share_pct"]
+
+                    grid_c = base.round(1).copy()
+                    grid_c.columns = [MONTHS_ALL[m] for m in grid_c.columns]
+                    grid_c = grid_c.reset_index().rename(columns={"item": "Размер"})
+
+                    ed_c = st.data_editor(
+                        grid_c, hide_index=True, use_container_width=True,
+                        column_config={
+                            "Размер": st.column_config.TextColumn(disabled=True),
+                        },
+                        key=f"curve_edit_{gk_edit}",
                     )
 
-                a2, b2 = st.columns([3, 1])
-                note_c = a2.text_input("Комментарий", key="curve_note")
-                b2.metric("Изменено", len(changed_c))
+                    mon_cols = [c for c in grid_c.columns if c != "Размер"]
+                    before_c = grid_c.set_index("Размер")[mon_cols]
+                    after_c = ed_c.set_index("Размер")[mon_cols]
+                    diff_c = (after_c != before_c) & after_c.notna()
 
-                if st.button("Сохранить кривую", type="primary",
-                             disabled=changed_c.empty):
-                    try:
-                        n = save_curve_override(changed_c, author, note_c)
-                        st.cache_data.clear()
-                        st.success(
-                            f"Сохранено: {n}. В расчёт попадёт после того, как "
-                            "правка будет подключена к прогнозу."
+                    rev = {v: k for k, v in MONTHS_ALL.items()}
+                    changes_c = [
+                        {"group_key": gk_edit, "size": sz, "cal_month": rev[mn],
+                         "share_pct": after_c.loc[sz, mn]}
+                        for sz, row in diff_c.iterrows()
+                        for mn in mon_cols if row[mn]
+                    ]
+                    changed_c = pd.DataFrame(changes_c)
+
+                    sums = after_c.sum(axis=0)
+                    off = [m for m in mon_cols if abs(sums[m] - 100) > 5]
+                    if off:
+                        st.caption(
+                            "Сумма долей заметно отличается от 100% в месяцах: "
+                            + ", ".join(off)
+                            + ". При расчёте доли будут нормированы."
                         )
-                        st.rerun()
-                    except Exception as exc:  # noqa: BLE001
-                        st.error(f"Не сохранилось: {exc}")
+
+                    a2, b2 = st.columns([3, 1])
+                    note_c = a2.text_input("Комментарий", key="curve_note")
+                    b2.metric("Изменено", len(changed_c))
+
+                    if st.button("Сохранить кривую", type="primary",
+                                 disabled=changed_c.empty):
+                        try:
+                            n = save_curve_override(changed_c, author, note_c)
+                            st.cache_data.clear()
+                            st.success(f"Сохранено: {n}. Попадёт в расчёт "
+                                       "при следующей пересборке.")
+                            st.rerun()
+                        except Exception as exc:  # noqa: BLE001
+                            st.error(f"Не сохранилось: {exc}")
 
 # ------------------------------------------------------------------ план/факт
 with tab_cmp:
