@@ -2,20 +2,29 @@
 Ежедневное обновление данных forecast.
 
 Что делает:
-  1. Выгружает четыре листа Google Sheets в CSV (через export?format=csv).
+  1. Выгружает листы Google Sheets в CSV (через export?format=csv).
   2. Перезаливает их в нативные таблицы mt.*_native.
-  3. Вызывает forecast.sp_refresh_gold() — пересборка всего gold-слоя.
+  3. Проверяет, что silver-слой видит данные и сток не пустой.
+  4. Вызывает forecast.sp_refresh_gold() — пересборка всего gold-слоя.
 
 Почему через CSV, а не external tables: тяжёлые листы отдаются BigQuery
 по 250+ секунд и падают с "Google Sheets service overloaded". Экспорт
 файлом обходит это ограничение.
 
+Два режима загрузки:
+  * "auto"   — колонки string_field_N, как у старых источников;
+  * "letter" — колонки col_A, col_B … ровно по диапазону листа, как было у
+               external-таблицы. От этих имён зависят вьюхи stock_current,
+               group_cogs, legacy_*, поэтому ширину обрезаем/добиваем точно.
+
 Права: сервис-аккаунту нужны roles/bigquery.jobUser + dataEditor на проект,
-и оба документа должны быть расшарены на его адрес (Viewer).
+все документы расшарены на его адрес (Viewer), включён Sheets API.
 """
 
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import os
 import sys
@@ -32,17 +41,30 @@ LOCATION = "EU"
 
 SHEET_SALES = "1rIUaZShBOVl7-zN_tzgJUle3vZukujrbJL40V6EaWIY"
 SHEET_SPR = "1-vtLKK5KBfE7S8Ho_1xCCwg_eXUmdKd7ElWWIufj9Rs"
+SHEET_ORDERS_STOCK = "1LNJGa_89vUqSUJZ6CEI2MA5iAmvPMrQ-M74kFcCA_LU"
+SHEET_ISHODNIK = "1b3RWGwKP3_g_bA8JCuc6-XHCTRw3KiPlW8ROIUFH9qs"
 
-# (таблица назначения, id документа, gid листа, символ кавычки, кавычки с переносами)
+# Источник: таблица, документ, лист (gid или имя), режим, кавычки,
+#           кавычки с переносами, ширина для режима letter.
 #
-# quote_char = '"'  — обычный CSV
-# quote_char = ""   — кавычки не обрабатываются; нужно для листов, где формулы
-#                     вернули #REF! и кавычки внутри полей стоят непарно
+# Лист задаётся либо gid (строка из цифр), либо именем вкладки — тогда gid
+# находится через Sheets API. По имени надёжнее: gid меняется, если вкладку
+# пересоздали, а имя обычно нет.
+#
+# quote_char = '"' — обычный CSV
+# quote_char = ""  — кавычки не обрабатываются; для листов, где формулы
+#                    вернули #REF! и кавычки внутри полей стоят непарно
 SOURCES = [
-    ("mt.sales_us_fact_native",  SHEET_SALES, "2127822292", '"', False),
-    ("mt.sales_oos_amz_native",  SHEET_SALES, "404969167",  "",  False),
-    ("mt.sales_plus_oos_native", SHEET_SALES, "1547531617", "",  False),
-    ("mt.SPR_native",            SHEET_SPR,   "2096733449", '"', True),
+    # table,                          doc,                sheet,                          mode,     quote, nl,    width
+    ("mt.sales_us_fact_native",       SHEET_SALES,        "2127822292",                   "auto",   '"',   False, None),
+    ("mt.sales_oos_amz_native",       SHEET_SALES,        "404969167",                    "auto",   "",    False, None),
+    ("mt.sales_plus_oos_native",      SHEET_SALES,        "1547531617",                   "auto",   "",    False, None),
+    ("mt.SPR_native",                 SHEET_SPR,          "2096733449",                   "auto",   '"',   True,  None),
+    # сток на руках и себестоимость — диапазон A:AM (39 колонок)
+    ("mt.amazon_starting_balance_native", SHEET_ORDERS_STOCK,
+                                      "Starting Amazon month Balance", "letter", '"',  True,  39),
+    # legacy-план, приходы и старый сток — диапазон A:JC (263 колонки)
+    ("mt.ishodnik_native",            SHEET_ISHODNIK,     "исходник",                     "letter", '"',   True,  263),
 ]
 
 # ожидаемое число строк — если после загрузки сильно меньше, значит формат уехал
@@ -51,6 +73,8 @@ MIN_ROWS = {
     "mt.sales_oos_amz_native": 5000,
     "mt.sales_plus_oos_native": 5000,
     "mt.SPR_native": 5000,
+    "mt.amazon_starting_balance_native": 5000,
+    "mt.ishodnik_native": 10000,
 }
 
 SCOPES = [
@@ -61,7 +85,7 @@ SCOPES = [
 # Google жёстко троттлит экспорт Sheets: несколько файлов подряд из одного
 # документа почти всегда дают 400. Помогают только длинные паузы.
 RETRIES = 5
-RETRY_WAIT = 120        # между попытками одного листа
+RETRY_WAIT = 120        # между попытками одного листа, растёт с каждой
 PAUSE_BETWEEN = 60      # между разными листами
 
 logging.basicConfig(
@@ -72,50 +96,112 @@ logging.basicConfig(
 log = logging.getLogger("refresh")
 
 
+# ------------------------------------------------------------------ утилиты
+def col_letters(n: int) -> list[str]:
+    """Имена колонок как в Google Sheets: A … Z, AA … AZ, BA …"""
+    out = []
+    for i in range(n):
+        s, x = "", i
+        while True:
+            s = chr(ord("A") + x % 26) + s
+            x = x // 26 - 1
+            if x < 0:
+                break
+        out.append(s)
+    return out
+
+
 def get_token() -> str:
     creds, _ = google.auth.default(scopes=SCOPES)
     creds.refresh(google.auth.transport.requests.Request())
     return creds.token
 
 
-def download_sheet(sheet_id: str, gid: str, path: str, token: str) -> int:
-    """Скачивает лист в CSV. Возвращает размер файла в байтах."""
-    url = (
-        f"https://docs.google.com/spreadsheets/d/{sheet_id}"
-        f"/export?format=csv&gid={gid}"
-    )
+def resolve_gid(doc_id: str, sheet: str, token: str) -> str:
+    """Если лист задан именем — находит его gid через Sheets API."""
+    if sheet.isdigit():
+        return sheet
     resp = requests.get(
-        url, headers={"Authorization": f"Bearer {token}"}, timeout=600
+        f"https://sheets.googleapis.com/v4/spreadsheets/{doc_id}",
+        params={"fields": "sheets.properties(sheetId,title)"},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=60,
     )
+    resp.raise_for_status()
+    for s in resp.json().get("sheets", []):
+        p = s["properties"]
+        if p["title"] == sheet:
+            return str(p["sheetId"])
+    raise RuntimeError(f"В документе {doc_id} нет листа «{sheet}»")
+
+
+def download_sheet(doc_id: str, gid: str, path: str, token: str) -> int:
+    """Скачивает лист в CSV. Редирект на googleusercontent идёт без
+    Authorization: ссылка уже подписана, а лишний токен даёт 400."""
+    url = (f"https://docs.google.com/spreadsheets/d/{doc_id}"
+           f"/export?format=csv&gid={gid}")
+    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"},
+                        timeout=600, allow_redirects=False)
+    if resp.status_code in (301, 302, 303, 307, 308):
+        resp = requests.get(resp.headers["Location"], timeout=600)
     resp.raise_for_status()
 
     head = resp.content[:200].lstrip()
     if head.startswith(b"<!DOCTYPE") or head.startswith(b"<html"):
         raise RuntimeError(
             f"Вместо CSV пришёл HTML (лист {gid}). Проверьте доступ "
-            f"сервис-аккаунта к документу {sheet_id}."
+            f"сервис-аккаунта к документу {doc_id}."
         )
-
     with open(path, "wb") as fh:
         fh.write(resp.content)
     return len(resp.content)
 
 
-def load_csv(client: bigquery.Client, table: str, path: str,
-             quote_char: str, quoted_newlines: bool) -> int:
+def reshape_to_letters(path: str, width: int) -> str:
+    """Обрезает или добивает каждую строку ровно до width колонок и
+    переписывает CSV с полным экранированием — BigQuery получает ровную
+    таблицу независимо от того, сколько лишних колонок было в листе."""
+    with open(path, encoding="utf-8", newline="") as fh:
+        rows = list(csv.reader(fh))
+    buf = io.StringIO()
+    w = csv.writer(buf, quoting=csv.QUOTE_ALL)
+    for r in rows:
+        r = (r + [""] * width)[:width]
+        w.writerow(r)
+    out = path + ".letters.csv"
+    with open(out, "w", encoding="utf-8", newline="") as fh:
+        fh.write(buf.getvalue())
+    return out
+
+
+def load_csv(client: bigquery.Client, table: str, path: str, mode: str,
+             quote_char: str, quoted_newlines: bool,
+             width: int | None) -> int:
     """Перезаливает CSV в нативную таблицу. Возвращает число строк."""
-    cfg = bigquery.LoadJobConfig(
-        source_format=bigquery.SourceFormat.CSV,
-        skip_leading_rows=0,
-        autodetect=True,
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-        allow_quoted_newlines=quoted_newlines,
-        quote_character=quote_char,
-    )
+    if mode == "letter":
+        path = reshape_to_letters(path, width)
+        cfg = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.CSV,
+            skip_leading_rows=0,
+            autodetect=False,
+            schema=[bigquery.SchemaField(f"col_{c}", "STRING")
+                    for c in col_letters(width)],
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            allow_quoted_newlines=True,
+            quote_character='"',
+        )
+    else:
+        cfg = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.CSV,
+            skip_leading_rows=0,
+            autodetect=True,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            allow_quoted_newlines=quoted_newlines,
+            quote_character=quote_char,
+        )
     with open(path, "rb") as fh:
         job = client.load_table_from_file(
-            fh, f"{PROJECT}.{table}", job_config=cfg, location=LOCATION
-        )
+            fh, f"{PROJECT}.{table}", job_config=cfg, location=LOCATION)
     job.result()
     return client.get_table(f"{PROJECT}.{table}").num_rows
 
@@ -136,69 +222,79 @@ def with_retries(fn, what: str):
     raise RuntimeError(f"{what}: не удалось после {RETRIES} попыток") from last
 
 
+def count(client: bigquery.Client, sql: str) -> int:
+    return list(client.query(sql, location=LOCATION).result())[0][0]
+
+
+# ------------------------------------------------------------------ main
 def main() -> int:
     client = bigquery.Client(project=PROJECT, location=LOCATION)
     token = get_token()
     tmp = tempfile.mkdtemp()
 
-    for table, sheet_id, gid, quote_char, quoted in SOURCES:
+    for i, (table, doc, sheet, mode, quote, nl, width) in enumerate(SOURCES):
+        gid = with_retries(lambda: resolve_gid(doc, sheet, token),
+                           f"поиск листа {table}")
         path = os.path.join(tmp, f"{table.split('.')[-1]}.csv")
 
-        size = with_retries(
-            lambda: download_sheet(sheet_id, gid, path, token),
-            f"выгрузка {table}",
-        )
+        size = with_retries(lambda: download_sheet(doc, gid, path, token),
+                            f"выгрузка {table}")
         log.info("%s: скачано %.1f МБ", table, size / 1024 / 1024)
 
         rows = with_retries(
-            lambda: load_csv(client, table, path, quote_char, quoted),
-            f"загрузка {table}",
-        )
+            lambda: load_csv(client, table, path, mode, quote, nl, width),
+            f"загрузка {table}")
         log.info("%s: загружено строк — %d", table, rows)
 
-        if rows < MIN_ROWS.get(table, 100):
+        minimum = MIN_ROWS.get(table, 100)
+        if rows < minimum:
             raise RuntimeError(
-                f"{table}: строк {rows}, ожидалось не меньше "
-                f"{MIN_ROWS.get(table, 100)} — формат уехал, пересборку не запускаю"
-            )
+                f"{table}: строк {rows}, ожидалось не меньше {minimum} — "
+                "формат уехал, пересборку не запускаю")
 
-        if table != SOURCES[-1][0]:
+        if i < len(SOURCES) - 1:
             log.info("пауза %d с перед следующим листом", PAUSE_BETWEEN)
             time.sleep(PAUSE_BETWEEN)
 
-    # источники загружены — проверяем, что silver-слой их видит
+    # ---------------------------------------------- проверки silver-слоя
     checks = [
-        ("fact_sales_monthly", 100000),
-        ("oos_monthly", 100000),
-        ("dim_product", 5000),
-        ("group_demand_monthly", 1000),
+        ("строк в fact_sales_monthly",
+         f"SELECT COUNT(*) FROM `{PROJECT}.forecast.fact_sales_monthly`", 100000),
+        ("строк в oos_monthly",
+         f"SELECT COUNT(*) FROM `{PROJECT}.forecast.oos_monthly`", 100000),
+        ("строк в dim_product",
+         f"SELECT COUNT(*) FROM `{PROJECT}.forecast.dim_product`", 5000),
+        ("строк в group_demand_monthly",
+         f"SELECT COUNT(*) FROM `{PROJECT}.forecast.group_demand_monthly`", 1000),
+        # свежесть стока: если источник приехал пустым или колонка слетела,
+        # план посчитается без остатка — такого не пропускаем
+        ("ASIN с остатком в stock_current",
+         f"SELECT COUNTIF(stock_us > 0) FROM `{PROJECT}.forecast.stock_current`", 1000),
+        ("ASIN с остатком в dim_product (Stock US)",
+         f"SELECT COUNTIF(stock_us > 0) FROM `{PROJECT}.forecast.dim_product`", 1000),
+        ("строк в legacy_incoming",
+         f"SELECT COUNT(*) FROM `{PROJECT}.forecast.legacy_incoming`", 1000),
     ]
-    for view, minimum in checks:
-        n = list(client.query(
-            f"SELECT COUNT(*) AS n FROM `{PROJECT}.forecast.{view}`",
-            location=LOCATION,
-        ).result())[0].n
-        log.info("%s: строк %d", view, n)
+    for label, sql, minimum in checks:
+        n = count(client, sql)
+        log.info("%s: %d", label, n)
         if n < minimum:
             raise RuntimeError(
-                f"forecast.{view}: строк {n}, ожидалось не меньше {minimum} — "
-                "источник распарсился неверно, пересборку не запускаю"
-            )
+                f"{label}: {n}, ожидалось не меньше {minimum} — "
+                "источник пришёл неполным, пересборку не запускаю")
 
     log.info("Запускаю sp_refresh_gold — это несколько минут")
-    client.query(
-        f"CALL `{PROJECT}.forecast.sp_refresh_gold`()", location=LOCATION
-    ).result()
+    client.query(f"CALL `{PROJECT}.forecast.sp_refresh_gold`()",
+                 location=LOCATION).result()
 
-    check = list(client.query(
+    for row in client.query(
         f"""
         SELECT kind, MAX(month) AS mx, COUNT(*) AS n
         FROM `{PROJECT}.forecast.looker_fact_monthly`
         GROUP BY kind
         """,
         location=LOCATION,
-    ).result())
-    for row in check:
+    ).result():
         log.info("%s: до %s, строк %d", row.kind, row.mx, row.n)
 
     log.info("Готово")
