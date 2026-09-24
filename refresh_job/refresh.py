@@ -65,7 +65,44 @@ SOURCES = [
                                       "Starting Amazon month Balance", "letter", '"',  True,  39),
     # legacy-план, приходы и старый сток — диапазон A:JC (263 колонки)
     ("mt.ishodnik_native",            SHEET_ISHODNIK,     "исходник",                     "letter", '"',   True,  263),
+    # сырой сток из Hopted (Manage FBA Inventory) — меняется каждый день,
+    # в расчёт пока не идёт, нужен для истории остатков
+    ("mt.fba_stock_native",           SHEET_ORDERS_STOCK, "213063900",                    "auto",   '"',   True,  None),
 ]
+
+# Листы, срез которых сохраняется в mt.stock_history каждый день.
+# Строка хранится целиком как JSON — история не ломается, если в листе
+# добавят или переставят колонки.
+HISTORY_SOURCES = [
+    "mt.fba_stock_native",                  # ежедневный сток из Amazon
+    "mt.amazon_starting_balance_native",    # остаток на начало месяца
+]
+
+# Проверка содержимого сразу после загрузки. Если не прошла — лист
+# выгружается заново: формулы в справочнике иногда не успевают досчитаться
+# к моменту экспорта, и колонка приезжает пустой. Через пару минут обычно
+# всё на месте.
+# Последнее поле — строгая ли проверка. Строгая останавливает пересборку,
+# мягкая только пишет предупреждение.
+#   * стартовый остаток — главный источник стока для плана, строгая;
+#   * Stock US в справочнике — запасной, план считается и без него, мягкая.
+CONTENT_CHECKS = {
+    "mt.SPR_native": (
+        "SELECT COUNTIF(SAFE_CAST(string_field_38 AS NUMERIC) > 0) "
+        "FROM `{table}`",
+        1000,
+        "товаров с остатком в Stock US",
+        False,
+    ),
+    "mt.amazon_starting_balance_native": (
+        "SELECT COUNTIF(SAFE_CAST(col_F AS NUMERIC) > 0) FROM `{table}`",
+        1000,
+        "товаров с остатком",
+        True,
+    ),
+}
+CONTENT_RETRIES = 3
+CONTENT_WAIT = 240      # секунд между повторными выгрузками
 
 # ожидаемое число строк — если после загрузки сильно меньше, значит формат уехал
 MIN_ROWS = {
@@ -75,6 +112,7 @@ MIN_ROWS = {
     "mt.SPR_native": 5000,
     "mt.amazon_starting_balance_native": 5000,
     "mt.ishodnik_native": 10000,
+    "mt.fba_stock_native": 500,
 }
 
 SCOPES = [
@@ -226,6 +264,75 @@ def count(client: bigquery.Client, sql: str) -> int:
     return list(client.query(sql, location=LOCATION).result())[0][0]
 
 
+def save_history(client: bigquery.Client) -> None:
+    """Дописывает сегодняшний срез в mt.stock_history. Повторный запуск в тот
+    же день заменяет срез, а не дублирует. Сравнивает со вчерашним: если
+    сток не изменился ни в одной строке — это похоже на замороженный
+    источник, пишем предупреждение."""
+    client.query(
+        f"""
+        CREATE TABLE IF NOT EXISTS `{PROJECT}.mt.stock_history` (
+          snapshot_date DATE      NOT NULL,
+          source        STRING    NOT NULL,
+          row_json      STRING,
+          loaded_at     TIMESTAMP
+        )
+        PARTITION BY snapshot_date
+        OPTIONS (description = 'Ежедневные срезы листов стока. Строка — JSON.')
+        """,
+        location=LOCATION,
+    ).result()
+
+    for table in HISTORY_SOURCES:
+        src_name = table.split(".")[-1]
+        client.query(
+            f"""
+            DELETE FROM `{PROJECT}.mt.stock_history`
+            WHERE snapshot_date = CURRENT_DATE('Europe/Kyiv')
+              AND source = '{src_name}';
+
+            INSERT INTO `{PROJECT}.mt.stock_history`
+              (snapshot_date, source, row_json, loaded_at)
+            SELECT CURRENT_DATE('Europe/Kyiv'), '{src_name}',
+                   TO_JSON_STRING(t), CURRENT_TIMESTAMP()
+            FROM `{PROJECT}.{table}` t;
+            """,
+            location=LOCATION,
+        ).result()
+
+        # сравнение со вчерашним срезом
+        row = list(client.query(
+            f"""
+            WITH today AS (
+              SELECT row_json FROM `{PROJECT}.mt.stock_history`
+              WHERE snapshot_date = CURRENT_DATE('Europe/Kyiv')
+                AND source = '{src_name}'
+            ),
+            prev AS (
+              SELECT row_json FROM `{PROJECT}.mt.stock_history`
+              WHERE source = '{src_name}'
+                AND snapshot_date = (
+                  SELECT MAX(snapshot_date) FROM `{PROJECT}.mt.stock_history`
+                  WHERE source = '{src_name}'
+                    AND snapshot_date < CURRENT_DATE('Europe/Kyiv'))
+            )
+            SELECT
+              (SELECT COUNT(*) FROM today)                              AS n_today,
+              (SELECT COUNT(*) FROM prev)                               AS n_prev,
+              (SELECT COUNT(*) FROM today
+                 WHERE row_json NOT IN (SELECT row_json FROM prev))     AS changed
+            """,
+            location=LOCATION,
+        ).result())[0]
+
+        log.info("история %s: срез %d строк, вчера %d, изменилось %d",
+                 src_name, row.n_today, row.n_prev, row.changed)
+        if (src_name == "fba_stock_native" and row.n_prev > 0
+                and row.changed == 0):
+            log.warning("история %s: ни одна строка не изменилась со вчера — "
+                        "похоже, Hopted перестал обновлять лист", src_name)
+
+
 # ------------------------------------------------------------------ main
 def main() -> int:
     client = bigquery.Client(project=PROJECT, location=LOCATION)
@@ -237,14 +344,40 @@ def main() -> int:
                            f"поиск листа {table}")
         path = os.path.join(tmp, f"{table.split('.')[-1]}.csv")
 
-        size = with_retries(lambda: download_sheet(doc, gid, path, token),
-                            f"выгрузка {table}")
-        log.info("%s: скачано %.1f МБ", table, size / 1024 / 1024)
+        check = CONTENT_CHECKS.get(table)
+        for content_try in range(1, CONTENT_RETRIES + 1):
+            size = with_retries(
+                lambda: download_sheet(doc, gid, path, token),
+                f"выгрузка {table}")
+            log.info("%s: скачано %.1f МБ", table, size / 1024 / 1024)
 
-        rows = with_retries(
-            lambda: load_csv(client, table, path, mode, quote, nl, width),
-            f"загрузка {table}")
-        log.info("%s: загружено строк — %d", table, rows)
+            rows = with_retries(
+                lambda: load_csv(client, table, path, mode, quote, nl, width),
+                f"загрузка {table}")
+            log.info("%s: загружено строк — %d", table, rows)
+
+            if not check:
+                break
+            sql, minimum, label, strict = check
+            got = count(client, sql.format(table=f"{PROJECT}.{table}"))
+            log.info("%s: %s — %d", table, label, got)
+            if got >= minimum:
+                break
+            if content_try < CONTENT_RETRIES:
+                log.warning("%s: %s %d меньше %d — формулы не досчитались, "
+                            "выгружу заново через %d с",
+                            table, label, got, minimum, CONTENT_WAIT)
+                time.sleep(CONTENT_WAIT)
+                token = get_token()
+            elif strict:
+                raise RuntimeError(
+                    f"{table}: {label} {got} после {CONTENT_RETRIES} попыток, "
+                    f"ожидалось не меньше {minimum} — источник пустой, "
+                    "пересборку не запускаю")
+            else:
+                log.warning("%s: %s %d после %d попыток — колонка в источнике "
+                            "пустая. Это запасной источник, продолжаю без него.",
+                            table, label, got, CONTENT_RETRIES)
 
         minimum = MIN_ROWS.get(table, 100)
         if rows < minimum:
@@ -255,6 +388,13 @@ def main() -> int:
         if i < len(SOURCES) - 1:
             log.info("пауза %d с перед следующим листом", PAUSE_BETWEEN)
             time.sleep(PAUSE_BETWEEN)
+
+    # ---------------------------------------------- история стока
+    # не критично: если срез не сохранился, пересборку не останавливаем
+    try:
+        save_history(client)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("срез истории не сохранился: %s", exc)
 
     # ---------------------------------------------- проверки silver-слоя
     checks = [
@@ -270,8 +410,6 @@ def main() -> int:
         # план посчитается без остатка — такого не пропускаем
         ("ASIN с остатком в stock_current",
          f"SELECT COUNTIF(stock_us > 0) FROM `{PROJECT}.forecast.stock_current`", 1000),
-        ("ASIN с остатком в dim_product (Stock US)",
-         f"SELECT COUNTIF(stock_us > 0) FROM `{PROJECT}.forecast.dim_product`", 1000),
         ("строк в legacy_incoming",
          f"SELECT COUNT(*) FROM `{PROJECT}.forecast.legacy_incoming`", 1000),
     ]
