@@ -43,6 +43,7 @@ SHEET_SALES = "1rIUaZShBOVl7-zN_tzgJUle3vZukujrbJL40V6EaWIY"
 SHEET_SPR = "1-vtLKK5KBfE7S8Ho_1xCCwg_eXUmdKd7ElWWIufj9Rs"
 SHEET_ORDERS_STOCK = "1LNJGa_89vUqSUJZ6CEI2MA5iAmvPMrQ-M74kFcCA_LU"
 SHEET_ISHODNIK = "1b3RWGwKP3_g_bA8JCuc6-XHCTRw3KiPlW8ROIUFH9qs"
+SHEET_HOPTED = "16AjBg-FziOJj7qE34y9KACWMPLjiHUv3B0BDebgaI4Q"   # сюда пишет Hopted
 
 # Источник: таблица, документ, лист (gid или имя), режим, кавычки,
 #           кавычки с переносами, ширина для режима letter.
@@ -65,16 +66,22 @@ SOURCES = [
                                       "Starting Amazon month Balance", "letter", '"',  True,  39),
     # legacy-план, приходы и старый сток — диапазон A:JC (263 колонки)
     ("mt.ishodnik_native",            SHEET_ISHODNIK,     "исходник",                     "letter", '"',   True,  263),
-    # сырой сток из Hopted (Manage FBA Inventory) — меняется каждый день,
-    # в расчёт пока не идёт, нужен для истории остатков
-    ("mt.fba_stock_native",           SHEET_ORDERS_STOCK, "213063900",                    "auto",   '"',   True,  None),
+    # сырой сток прямо из файла Hopted (Manage FBA Inventory) — ближе всего
+    # к Amazon, меняется каждый день. В расчёт пока не идёт, нужен для истории.
+    ("mt.hopted_us_native",           SHEET_HOPTED,       "US V2",                        "auto",   '"',   True,  None),
+    ("mt.hopted_ca_native",           SHEET_HOPTED,       "CA inv",                       "auto",   '"',   True,  None),
+    ("mt.hopted_de_native",           SHEET_HOPTED,       "DE inv",                       "auto",   '"',   True,  None),
+    ("mt.hopted_uk_native",           SHEET_HOPTED,       "UK inv",                       "auto",   '"',   True,  None),
 ]
 
 # Листы, срез которых сохраняется в mt.stock_history каждый день.
 # Строка хранится целиком как JSON — история не ломается, если в листе
 # добавят или переставят колонки.
 HISTORY_SOURCES = [
-    "mt.fba_stock_native",                  # ежедневный сток из Amazon
+    "mt.hopted_us_native",                  # ежедневный сток из Amazon (Hopted)
+    "mt.hopted_ca_native",
+    "mt.hopted_de_native",
+    "mt.hopted_uk_native",
     "mt.amazon_starting_balance_native",    # остаток на начало месяца
 ]
 
@@ -112,7 +119,10 @@ MIN_ROWS = {
     "mt.SPR_native": 5000,
     "mt.amazon_starting_balance_native": 5000,
     "mt.ishodnik_native": 10000,
-    "mt.fba_stock_native": 500,
+    "mt.hopted_us_native": 1000,
+    "mt.hopted_ca_native": 500,
+    "mt.hopted_de_native": 500,
+    "mt.hopted_uk_native": 500,
 }
 
 SCOPES = [
@@ -327,7 +337,7 @@ def save_history(client: bigquery.Client) -> None:
 
         log.info("история %s: срез %d строк, вчера %d, изменилось %d",
                  src_name, row.n_today, row.n_prev, row.changed)
-        if (src_name == "fba_stock_native" and row.n_prev > 0
+        if (src_name.startswith("hopted_") and row.n_prev > 0
                 and row.changed == 0):
             log.warning("история %s: ни одна строка не изменилась со вчера — "
                         "похоже, Hopted перестал обновлять лист", src_name)
