@@ -131,6 +131,39 @@ def run(sql: str, params: list | None = None) -> pd.DataFrame:
     return _to_float(job.result().to_dataframe())
 
 
+# ------------------------------------------------------------------ журнал входов
+LOGIN_LOG = f"{PROJECT}.forecast.login_log"
+TZ = "Europe/Kiev"
+ADMINS = {"v.tereshyn@maximumstores.online", "s.yaremenko@maximumstores.online"}
+
+
+def log_login(email: str) -> None:
+    """Одна строка на каждый вход (новую сессию). Если запись не удалась —
+    дашборд всё равно открывается, журнал не важнее работы."""
+    if st.session_state.get("_login_logged"):
+        return
+    try:
+        client.query(
+            f"""
+            CREATE TABLE IF NOT EXISTS `{LOGIN_LOG}` (
+              email STRING NOT NULL,
+              logged_in_at TIMESTAMP NOT NULL
+            )
+            PARTITION BY DATE(logged_in_at);
+            INSERT INTO `{LOGIN_LOG}` (email, logged_in_at)
+            VALUES (@email, CURRENT_TIMESTAMP());
+            """,
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("email", "STRING", email)]),
+        ).result()
+        st.session_state["_login_logged"] = True
+    except Exception:  # noqa: BLE001
+        pass
+
+
+log_login(author)
+
+
 # ------------------------------------------------------------------ данные
 @st.cache_data(ttl=600)
 def load_planned_groups() -> set:
@@ -991,9 +1024,13 @@ else:
     scope = " · ".join(parts)
 st.caption(f"Данные BigQuery · {scope}")
 
-sec_act, sec_data, sec_plan, sec_check = st.tabs(
-    ["Что делать", "Данные", "Планирование", "Сверка"]
-)
+is_admin = author in ADMINS
+_sections = ["Что делать", "Данные", "Планирование", "Сверка"]
+if is_admin:
+    _sections.append("Использование")
+_sec = st.tabs(_sections)
+sec_act, sec_data, sec_plan, sec_check = _sec[:4]
+sec_usage = _sec[4] if is_admin else None
 
 with sec_act:
     tab_alert, tab_core, tab_needs = st.tabs(
@@ -2254,3 +2291,93 @@ with tab_hist:
         st.info("Ручных правок ещё нет. Первая появится здесь сразу после сохранения.")
     else:
         st.dataframe(hist, hide_index=True, use_container_width=True)
+
+
+# ------------------------------------------------------------------ использование
+@st.cache_data(ttl=300)
+def load_usage() -> dict:
+    """Кто и как часто заходит в планер. Время — по Киеву."""
+    weekly = run(f"""
+        SELECT DATE_TRUNC(DATE(logged_in_at, '{TZ}'), WEEK(MONDAY)) AS week_start,
+               COUNT(DISTINCT email) AS unique_users,
+               COUNT(*) AS logins
+        FROM `{LOGIN_LOG}`
+        WHERE logged_in_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 63 DAY)
+        GROUP BY 1 ORDER BY 1""")
+    daily = run(f"""
+        SELECT DATE(logged_in_at, '{TZ}') AS day, COUNT(*) AS logins,
+               COUNT(DISTINCT email) AS users
+        FROM `{LOGIN_LOG}`
+        WHERE logged_in_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 14 DAY)
+        GROUP BY 1 ORDER BY 1""")
+    people = run(f"""
+        SELECT email,
+               COUNTIF(logged_in_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY))
+                 AS logins_30d,
+               COUNT(DISTINCT IF(
+                 logged_in_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY),
+                 DATE(logged_in_at, '{TZ}'), NULL)) AS active_days_30d,
+               DATETIME(MAX(logged_in_at), '{TZ}') AS last_login,
+               DATE_DIFF(CURRENT_DATE('{TZ}'), DATE(MAX(logged_in_at), '{TZ}'), DAY)
+                 AS days_since
+        FROM `{LOGIN_LOG}`
+        GROUP BY email
+        ORDER BY last_login DESC""")
+    today = run(f"SELECT CURRENT_DATE('{TZ}') AS d")["d"].iloc[0]
+    return {"weekly": weekly, "daily": daily, "people": people, "today": today}
+
+
+if sec_usage is not None:
+    with sec_usage:
+        tab_intro(
+            "Кто и как часто заходит в планер",
+            "Каждый вход через Google записывается в журнал. Пользователь — "
+            "тот, кто заходил хотя бы раз за последние 90 дней; доля активных "
+            "считается от них. Вкладку видят только админы.",
+        )
+        try:
+            u = load_usage()
+        except Exception as exc:  # noqa: BLE001
+            st.info(f"Журнал входов пока пуст или недоступен: {exc}")
+            u = None
+
+        if u is not None and not u["people"].empty:
+            people = u["people"]
+            team = int((people["days_since"] <= 90).sum()) or 1
+
+            # последние 8 недель, включая текущую, даже если входов не было
+            today = pd.Timestamp(u["today"])        # сегодня по Киеву, из BigQuery
+            weeks = pd.date_range(end=today - pd.Timedelta(days=today.weekday()),
+                                  periods=8, freq="W-MON")
+            wk = u["weekly"].copy()
+            wk["week_start"] = pd.to_datetime(wk["week_start"])
+            wk = (wk.set_index("week_start").reindex(weeks, fill_value=0)
+                  .rename_axis("week_start").reset_index())
+            wk["pct_active"] = (100 * wk["unique_users"] / team).round(1)
+
+            cur = wk.iloc[-1]
+            idle = int((people["days_since"] > 14).sum())
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Пользователей за 90 дней", team)
+            c2.metric("Активны на этой неделе", int(cur["unique_users"]))
+            c3.metric("Доля активных", f"{cur['pct_active']:.0f}%")
+            c4.metric("Не заходили >14 дней", idle)
+
+            st.markdown("**Активные пользователи по неделям, % от всех**")
+            st.bar_chart(wk.set_index("week_start")["pct_active"])
+
+            st.markdown("**Входы по дням, 14 дней**")
+            if u["daily"].empty:
+                st.caption("За две недели входов не было.")
+            else:
+                st.bar_chart(u["daily"].set_index("day")["logins"])
+
+            st.markdown("**По людям**")
+            st.dataframe(
+                people.rename(columns={
+                    "email": "Почта", "logins_30d": "Входов за 30 дней",
+                    "active_days_30d": "Активных дней за 30",
+                    "last_login": "Последний вход", "days_since": "Дней назад"}),
+                use_container_width=True, hide_index=True)
+        elif u is not None:
+            st.info("Журнал входов пока пуст — записи появятся после первых входов.")
