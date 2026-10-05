@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime as dt
 import decimal
+import threading
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -137,19 +138,58 @@ TZ = "Europe/Kiev"
 ADMINS = {"v.tereshyn@maximumstores.online", "s.yaremenko@maximumstores.online"}
 
 
+USAGE_EVENTS = f"{PROJECT}.forecast.usage_events"
+
+
+@st.cache_resource
+def ensure_usage_tables() -> bool:
+    """Создаёт таблицы журнала один раз на запуск приложения."""
+    client.query(f"""
+        CREATE TABLE IF NOT EXISTS `{LOGIN_LOG}` (
+          email STRING NOT NULL,
+          logged_in_at TIMESTAMP NOT NULL
+        )
+        PARTITION BY DATE(logged_in_at);
+        CREATE TABLE IF NOT EXISTS `{USAGE_EVENTS}` (
+          email STRING NOT NULL,
+          ts TIMESTAMP NOT NULL,
+          event STRING NOT NULL,
+          detail STRING
+        )
+        PARTITION BY DATE(ts);
+        """).result()
+    return True
+
+
+def log_event(event: str, detail: str) -> None:
+    """Пишет событие в фоне — пользователь не ждёт BigQuery."""
+    email = author
+
+    def _write() -> None:
+        try:
+            client.query(
+                f"INSERT INTO `{USAGE_EVENTS}` (email, ts, event, detail) "
+                "VALUES (@email, CURRENT_TIMESTAMP(), @event, @detail)",
+                job_config=bigquery.QueryJobConfig(query_parameters=[
+                    bigquery.ScalarQueryParameter("email", "STRING", email),
+                    bigquery.ScalarQueryParameter("event", "STRING", event),
+                    bigquery.ScalarQueryParameter("detail", "STRING", detail)]),
+            ).result()
+        except Exception:  # noqa: BLE001
+            pass
+
+    threading.Thread(target=_write, daemon=True).start()
+
+
 def log_login(email: str) -> None:
     """Одна строка на каждый вход (новую сессию). Если запись не удалась —
     дашборд всё равно открывается, журнал не важнее работы."""
     if st.session_state.get("_login_logged"):
         return
     try:
+        ensure_usage_tables()
         client.query(
             f"""
-            CREATE TABLE IF NOT EXISTS `{LOGIN_LOG}` (
-              email STRING NOT NULL,
-              logged_in_at TIMESTAMP NOT NULL
-            )
-            PARTITION BY DATE(logged_in_at);
             INSERT INTO `{LOGIN_LOG}` (email, logged_in_at)
             VALUES (@email, CURRENT_TIMESTAMP());
             """,
@@ -157,11 +197,16 @@ def log_login(email: str) -> None:
                 bigquery.ScalarQueryParameter("email", "STRING", email)]),
         ).result()
         st.session_state["_login_logged"] = True
+        log_event("tab", "Что делать → Внимание")   # стартовая вкладка
     except Exception:  # noqa: BLE001
         pass
 
 
 log_login(author)
+try:
+    ensure_usage_tables()          # для сессий, открытых до появления журнала событий
+except Exception:  # noqa: BLE001
+    pass
 
 
 # ------------------------------------------------------------------ данные
@@ -1028,25 +1073,49 @@ is_admin = author in ADMINS
 _sections = ["Что делать", "Данные", "Планирование", "Сверка"]
 if is_admin:
     _sections.append("Использование")
-_sec = st.tabs(_sections)
+# Разделы и подразделы. Каждое переключение пишется в журнал событий:
+# так видно, какими частями планера реально пользуются.
+SUBTABS = {
+    "Что делать": ("nav_act", ["Внимание", "Основные и прочие", "Требует плана"]),
+    "Данные": ("nav_data", ["Обзор", "Сезон", "Склад", "Разрезы"]),
+    "Планирование": ("nav_plan", ["Ввод плана", "Цель по складу", "Размерные кривые"]),
+    "Сверка": ("nav_check", ["План и факт", "Расхождения", "Правки"]),
+}
+
+
+def _on_tab(key: str, section: str | None = None) -> None:
+    label = st.session_state.get(key)
+    if section is None:                      # переключили раздел
+        section = label
+        sub = SUBTABS.get(section)
+        if sub:
+            label = st.session_state.get(sub[0]) or sub[1][0]
+        else:
+            label = None
+    log_event("tab", f"{section} → {label}" if label else section)
+
+
+_sec = st.tabs(_sections, key="nav_top", on_change=_on_tab, args=("nav_top",))
 sec_act, sec_data, sec_plan, sec_check = _sec[:4]
 sec_usage = _sec[4] if is_admin else None
 
+
+def _subtabs(section: str):
+    key, labels = SUBTABS[section]
+    return st.tabs(labels, key=key, on_change=_on_tab, args=(key, section))
+
+
 with sec_act:
-    tab_alert, tab_core, tab_needs = st.tabs(
-        ["Внимание", "Основные и прочие", "Требует плана"])
+    tab_alert, tab_core, tab_needs = _subtabs("Что делать")
 
 with sec_data:
-    tab_over, tab_track, tab_stock, tab_dims = st.tabs(
-        ["Обзор", "Сезон", "Склад", "Разрезы"])
+    tab_over, tab_track, tab_stock, tab_dims = _subtabs("Данные")
 
 with sec_plan:
-    tab_edit, tab_target, tab_curve = st.tabs(
-        ["Ввод плана", "Цель по складу", "Размерные кривые"])
+    tab_edit, tab_target, tab_curve = _subtabs("Планирование")
 
 with sec_check:
-    tab_cmp, tab_gap, tab_hist = st.tabs(
-        ["План и факт", "Расхождения", "Правки"])
+    tab_cmp, tab_gap, tab_hist = _subtabs("Сверка")
 
 # ------------------------------------------------------------------ внимание
 with tab_alert:
@@ -2294,9 +2363,33 @@ with tab_hist:
 
 
 # ------------------------------------------------------------------ использование
+USAGE_MAX_DAYS = 30
+
+
 @st.cache_data(ttl=300)
 def load_usage() -> dict:
     """Кто и как часто заходит в планер. Время — по Киеву."""
+    meta = run(f"""
+        SELECT CURRENT_DATE('{TZ}') AS today,
+               MIN(DATE(logged_in_at, '{TZ}')) AS first_day
+        FROM `{LOGIN_LOG}`""")
+    today = meta["today"].iloc[0]
+    first = meta["first_day"].iloc[0]
+    if first is None or pd.isna(first):
+        return {"today": today, "period": 0}
+    # период: от первой записи в журнале, но не больше 30 дней
+    period = min(USAGE_MAX_DAYS, (pd.Timestamp(today) - pd.Timestamp(first)).days + 1)
+    since = f"DATE_SUB(CURRENT_DATE('{TZ}'), INTERVAL {period - 1} DAY)"
+
+    people = run(f"""
+        SELECT email,
+               COUNT(*) AS logins,
+               COUNT(DISTINCT DATE(logged_in_at, '{TZ}')) AS active_days,
+               DATETIME(MAX(logged_in_at), '{TZ}') AS last_login
+        FROM `{LOGIN_LOG}`
+        WHERE DATE(logged_in_at, '{TZ}') >= {since}
+        GROUP BY email
+        ORDER BY logins DESC""")
     weekly = run(f"""
         SELECT DATE_TRUNC(DATE(logged_in_at, '{TZ}'), WEEK(MONDAY)) AS week_start,
                COUNT(DISTINCT email) AS unique_users,
@@ -2310,42 +2403,156 @@ def load_usage() -> dict:
         FROM `{LOGIN_LOG}`
         WHERE logged_in_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 14 DAY)
         GROUP BY 1 ORDER BY 1""")
-    people = run(f"""
-        SELECT email,
-               COUNTIF(logged_in_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY))
-                 AS logins_30d,
-               COUNT(DISTINCT IF(
-                 logged_in_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY),
-                 DATE(logged_in_at, '{TZ}'), NULL)) AS active_days_30d,
-               DATETIME(MAX(logged_in_at), '{TZ}') AS last_login,
-               DATE_DIFF(CURRENT_DATE('{TZ}'), DATE(MAX(logged_in_at), '{TZ}'), DAY)
-                 AS days_since
-        FROM `{LOGIN_LOG}`
-        GROUP BY email
-        ORDER BY last_login DESC""")
-    today = run(f"SELECT CURRENT_DATE('{TZ}') AS d")["d"].iloc[0]
-    return {"weekly": weekly, "daily": daily, "people": people, "today": today}
+    since_ts = f"TIMESTAMP({since}, '{TZ}')"
+    try:
+        sections = run(f"""
+            SELECT detail, COUNT(*) AS opens, COUNT(DISTINCT email) AS people,
+                   DATETIME(MAX(ts), '{TZ}') AS last_open
+            FROM `{USAGE_EVENTS}`
+            WHERE event = 'tab' AND ts >= {since_ts}
+            GROUP BY detail ORDER BY opens DESC""")
+        opens = run(f"""
+            SELECT email, COUNT(*) AS tab_opens
+            FROM `{USAGE_EVENTS}`
+            WHERE event = 'tab' AND ts >= {since_ts}
+            GROUP BY email""")
+    except Exception:  # noqa: BLE001  таблицы событий ещё нет
+        sections = pd.DataFrame(columns=["detail", "opens", "people", "last_open"])
+        opens = pd.DataFrame(columns=["email", "tab_opens"])
+    # правки: одно сохранение = все строки с одинаковым временем
+    edits = run(f"""
+        SELECT author AS email, kind,
+               COUNT(DISTINCT updated_at) AS saves, COUNT(*) AS cells,
+               DATETIME(MAX(updated_at), '{TZ}') AS last_edit
+        FROM (
+          SELECT author, 'План' AS kind, updated_at FROM `{TABLE_OVERRIDE}`
+          UNION ALL
+          SELECT author, 'Цель по складу', updated_at
+          FROM `{PROJECT}.forecast.target_stock`
+          UNION ALL
+          SELECT author, 'Кривые', updated_at
+          FROM `{PROJECT}.forecast.size_curve_override`
+        )
+        WHERE updated_at >= {since_ts} AND author IS NOT NULL
+        GROUP BY email, kind""")
+    return {"today": today, "period": period, "people": people,
+            "weekly": weekly, "daily": daily, "sections": sections,
+            "opens": opens, "edits": edits}
 
 
 if sec_usage is not None:
     with sec_usage:
-        tab_intro(
-            "Кто и как часто заходит в планер",
-            "Каждый вход через Google записывается в журнал. Пользователь — "
-            "тот, кто заходил хотя бы раз за последние 90 дней; доля активных "
-            "считается от них. Вкладку видят только админы.",
-        )
+        if st.session_state.get("_login_error"):
+            st.error("Вход не записался в журнал: "
+                     + st.session_state["_login_error"])
+        if st.button("Обновить", key="usage_refresh"):
+            load_usage.clear()
         try:
             u = load_usage()
         except Exception as exc:  # noqa: BLE001
-            st.info(f"Журнал входов пока пуст или недоступен: {exc}")
+            st.info(f"Журнал входов пока недоступен: {exc}")
             u = None
 
-        if u is not None and not u["people"].empty:
-            people = u["people"]
-            team = int((people["days_since"] <= 90).sum()) or 1
+        if u is not None and u["period"] == 0:
+            st.info("Журнал входов пока пуст — записи появятся после первых входов.")
+        elif u is not None:
+            period = u["period"]
+            people = u["people"].copy()
+            total = int(people["logins"].sum()) or 1
 
-            # последние 8 недель, включая текущую, даже если входов не было
+            # ---------------- таблица: кто пользуется
+            st.markdown("#### Кто пользуется дашбордом")
+            st.caption(
+                f"За {period} дн., время киевское. «Доля входов» — сколько "
+                "процентов всех входов команды пришлось на человека. "
+                "«Активность» — в сколько процентов дней периода он заходил "
+                "хотя бы раз.")
+            people["who"] = people["email"].str.split("@").str[0]
+            people["share"] = (100 * people["logins"] / total).round(0)
+            people["activity"] = (100 * people["active_days"] / period).round(0)
+            people["last"] = pd.to_datetime(people["last_login"]).dt.strftime("%d.%m %H:%M")
+            ed = u["edits"]
+            saves = ed.groupby("email")["saves"].sum() if not ed.empty else pd.Series(dtype=int)
+            opens = u["opens"].set_index("email")["tab_opens"] if not u["opens"].empty \
+                else pd.Series(dtype=int)
+            people["tabs"] = people["email"].map(opens).fillna(0).astype(int)
+            people["saves"] = people["email"].map(saves).fillna(0).astype(int)
+            st.dataframe(
+                people[["who", "logins", "share", "active_days", "activity",
+                        "tabs", "saves", "last"]],
+                hide_index=True, use_container_width=True,
+                column_config={
+                    "who": st.column_config.TextColumn("Сотрудник"),
+                    "logins": st.column_config.NumberColumn("Входов"),
+                    "share": st.column_config.ProgressColumn(
+                        "Доля входов, %", format="%d%%", min_value=0, max_value=100),
+                    "active_days": st.column_config.NumberColumn("Дней с входом"),
+                    "activity": st.column_config.ProgressColumn(
+                        "Активность, %", format="%d%%", min_value=0, max_value=100),
+                    "tabs": st.column_config.NumberColumn(
+                        "Открыл разделов", help="Сколько раз переключал разделы и вкладки"),
+                    "saves": st.column_config.NumberColumn(
+                        "Сохранил правок", help="План, цель по складу и кривые вместе"),
+                    "last": st.column_config.TextColumn("Последний вход"),
+                })
+
+            # ---------------- разделы
+            st.markdown("#### Какие разделы открывают")
+            secs = u["sections"]
+            if secs.empty:
+                st.caption("Пока нет данных — переключения вкладок начали "
+                           "записываться только сейчас.")
+            else:
+                secs = secs.copy()
+                secs["last"] = pd.to_datetime(secs["last_open"]).dt.strftime("%d.%m %H:%M")
+                top = int(secs["opens"].max()) or 1
+                st.dataframe(
+                    secs[["detail", "opens", "people", "last"]],
+                    hide_index=True, use_container_width=True,
+                    column_config={
+                        "detail": st.column_config.TextColumn("Раздел"),
+                        "opens": st.column_config.ProgressColumn(
+                            "Открытий", format="%d", min_value=0, max_value=top),
+                        "people": st.column_config.NumberColumn("Сотрудников"),
+                        "last": st.column_config.TextColumn("Последний раз"),
+                    })
+                never = [f"{s} → {t}" for s, (_, ts) in SUBTABS.items() for t in ts
+                         if f"{s} → {t}" not in set(secs["detail"])]
+                if never:
+                    st.caption("Ни разу не открывали за период: " + ", ".join(never))
+
+            # ---------------- правки
+            st.markdown("#### Кто правит план")
+            if ed.empty:
+                st.caption(f"За {period} дн. правок не было.")
+            else:
+                pv = ed.pivot_table(index="email", columns="kind", values="saves",
+                                    aggfunc="sum", fill_value=0)
+                for k in ["План", "Цель по складу", "Кривые"]:
+                    if k not in pv.columns:
+                        pv[k] = 0
+                pv = pv[["План", "Цель по складу", "Кривые"]]
+                pv.columns.name = None
+                pv["Ячеек изменено"] = ed.groupby("email")["cells"].sum()
+                pv["Последняя правка"] = (pd.to_datetime(ed.groupby("email")["last_edit"].max())
+                                          .dt.strftime("%d.%m %H:%M"))
+                pv.index = pv.index.str.split("@").str[0]
+                st.dataframe(pv.rename_axis("Сотрудник").reset_index(),
+                             hide_index=True, use_container_width=True)
+                st.caption("Число в колонках — сколько раз человек нажал «Сохранить» "
+                           "в этом разделе.")
+
+            # ---------------- графики
+            def _bars(x, y, text, color="#4C78A8", ymax=None):
+                fig = go.Figure(go.Bar(x=x, y=y, text=text,
+                                       textposition="outside",
+                                       marker_color=color))
+                fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10),
+                                  xaxis=dict(type="category"),
+                                  yaxis=dict(range=[0, ymax] if ymax else None,
+                                             rangemode="tozero"))
+                st.plotly_chart(fig, use_container_width=True)
+
             today = pd.Timestamp(u["today"])        # сегодня по Киеву, из BigQuery
             weeks = pd.date_range(end=today - pd.Timedelta(days=today.weekday()),
                                   periods=8, freq="W-MON")
@@ -2353,31 +2560,15 @@ if sec_usage is not None:
             wk["week_start"] = pd.to_datetime(wk["week_start"])
             wk = (wk.set_index("week_start").reindex(weeks, fill_value=0)
                   .rename_axis("week_start").reset_index())
-            wk["pct_active"] = (100 * wk["unique_users"] / team).round(1)
+            st.markdown("**Сотрудников со входом по неделям**")
+            _bars(wk["week_start"].dt.strftime("с %d.%m"), wk["unique_users"],
+                  [str(int(v)) if v else "" for v in wk["unique_users"]])
 
-            cur = wk.iloc[-1]
-            idle = int((people["days_since"] > 14).sum())
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Пользователей за 90 дней", team)
-            c2.metric("Активны на этой неделе", int(cur["unique_users"]))
-            c3.metric("Доля активных", f"{cur['pct_active']:.0f}%")
-            c4.metric("Не заходили >14 дней", idle)
-
-            st.markdown("**Активные пользователи по неделям, % от всех**")
-            st.bar_chart(wk.set_index("week_start")["pct_active"])
-
+            days = pd.date_range(end=today, periods=14, freq="D")
+            dl = u["daily"].copy()
+            dl["day"] = pd.to_datetime(dl["day"])
+            dl = (dl.set_index("day").reindex(days, fill_value=0)
+                  .rename_axis("day").reset_index())
             st.markdown("**Входы по дням, 14 дней**")
-            if u["daily"].empty:
-                st.caption("За две недели входов не было.")
-            else:
-                st.bar_chart(u["daily"].set_index("day")["logins"])
-
-            st.markdown("**По людям**")
-            st.dataframe(
-                people.rename(columns={
-                    "email": "Почта", "logins_30d": "Входов за 30 дней",
-                    "active_days_30d": "Активных дней за 30",
-                    "last_login": "Последний вход", "days_since": "Дней назад"}),
-                use_container_width=True, hide_index=True)
-        elif u is not None:
-            st.info("Журнал входов пока пуст — записи появятся после первых входов.")
+            _bars(dl["day"].dt.strftime("%d.%m"), dl["logins"],
+                  [str(int(v)) if v else "" for v in dl["logins"]], color="#72B7B2")
