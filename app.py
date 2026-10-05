@@ -2457,30 +2457,39 @@ def load_usage() -> dict:
     allowed = run(f"""
         SELECT DISTINCT LOWER(email) AS email FROM `{LOGIN_LOG}`
         WHERE LOWER(email) LIKE '%@{ALLOWED_DOMAIN}' ORDER BY 1""")
-    cmp7 = run(f"""
-        SELECT
-          COUNT(DISTINCT IF(d >= DATE_SUB(CURRENT_DATE('{TZ}'), INTERVAL 6 DAY), e, NULL))
-            AS this7,
-          COUNT(DISTINCT IF(d <  DATE_SUB(CURRENT_DATE('{TZ}'), INTERVAL 6 DAY), e, NULL))
-            AS prev7
+    # регулярность: сколько РАБОЧИХ дней (пн–пт) человек заходил —
+    # за последние 7 дней и за 7 дней до этого
+    reg = run(f"""
+        SELECT e AS email,
+          COUNT(DISTINCT IF(d >= DATE_SUB(CURRENT_DATE('{TZ}'), INTERVAL 6 DAY), d, NULL))
+            AS this_any,
+          COUNT(DISTINCT IF(d >= DATE_SUB(CURRENT_DATE('{TZ}'), INTERVAL 6 DAY) AND wd, d, NULL))
+            AS this_days,
+          COUNT(DISTINCT IF(d <  DATE_SUB(CURRENT_DATE('{TZ}'), INTERVAL 6 DAY), d, NULL))
+            AS prev_any,
+          COUNT(DISTINCT IF(d <  DATE_SUB(CURRENT_DATE('{TZ}'), INTERVAL 6 DAY) AND wd, d, NULL))
+            AS prev_days
         FROM (
-          SELECT LOWER(email) AS e, DATE(logged_in_at, '{TZ}') AS d
+          SELECT LOWER(email) AS e, DATE(logged_in_at, '{TZ}') AS d,
+                 EXTRACT(DAYOFWEEK FROM DATE(logged_in_at, '{TZ}')) NOT IN (1, 7) AS wd
           FROM `{LOGIN_LOG}`
           WHERE LOWER(email) LIKE '%@{ALLOWED_DOMAIN}'
             AND DATE(logged_in_at, '{TZ}') >= DATE_SUB(CURRENT_DATE('{TZ}'), INTERVAL 13 DAY)
-        )""")
-    last7, prev7 = int(cmp7["this7"].iloc[0]), int(cmp7["prev7"].iloc[0])
+        )
+        GROUP BY e""")
     weekly_allowed = run(f"""
         SELECT DATE_TRUNC(DATE(logged_in_at, '{TZ}'), WEEK(MONDAY)) AS week_start,
-               COUNT(DISTINCT LOWER(email)) AS users
+               LOWER(email) AS email,
+               COUNT(DISTINCT IF(EXTRACT(DAYOFWEEK FROM DATE(logged_in_at, '{TZ}'))
+                                 NOT IN (1, 7), DATE(logged_in_at, '{TZ}'), NULL)) AS days
         FROM `{LOGIN_LOG}`
         WHERE LOWER(email) LIKE '%@{ALLOWED_DOMAIN}'
           AND logged_in_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 63 DAY)
-        GROUP BY 1 ORDER BY 1""")
+        GROUP BY 1, 2""")
     return {"today": today, "period": period, "people": people,
             "weekly": weekly, "daily": daily, "sections": sections,
             "opens": opens, "edits": edits, "allowed": allowed,
-            "last7": last7, "prev7": prev7, "weekly_allowed": weekly_allowed}
+            "reg": reg, "weekly_allowed": weekly_allowed}
 
 
 if sec_usage is not None and _open(sec_usage):
@@ -2504,7 +2513,14 @@ if sec_usage is not None and _open(sec_usage):
             total = int(people["logins"].sum()) or 1
 
             today = pd.Timestamp(u["today"])        # сегодня по Киеву, из BigQuery
-            allowed = u["allowed"]["email"].tolist()
+            # база для %: команда планера из Secrets ([usage] team = [...])
+            # плюс все, кто хоть раз заходил
+            try:
+                team_raw = st.secrets.get("usage", {}).get("team", [])
+            except Exception:  # noqa: BLE001
+                team_raw = []
+            team = [str(e).strip().lower() for e in team_raw if str(e).strip()]
+            allowed = sorted(set(u["allowed"]["email"].tolist()) | set(team))
             n_allowed = len(allowed)
             weeks = pd.date_range(end=today - pd.Timedelta(days=today.weekday()),
                                   periods=8, freq="W-MON")
@@ -2513,8 +2529,13 @@ if sec_usage is not None and _open(sec_usage):
             if n_allowed == 0:
                 st.info("Пока никто не заходил — % посчитается после первых входов.")
             else:
-                pct = round(100 * u["last7"] / n_allowed)
-                pct_prev = round(100 * u["prev7"] / n_allowed)
+                rg = u["reg"]
+                # каждый сотрудник может набрать максимум 5 рабочих дней из 7
+                pct = round(100 * rg["this_days"].clip(upper=5).sum() / (5 * n_allowed))
+                pct_prev = round(100 * rg["prev_days"].clip(upper=5).sum() / (5 * n_allowed))
+                came = int((rg["this_any"] > 0).sum())
+                came_prev = int((rg["prev_any"] > 0).sum())
+                avg_days = rg["this_days"].clip(upper=5).sum() / n_allowed
                 delta = pct - pct_prev
                 if delta > 0:
                     bg, fg, sign = "#E3F4EA", "#1E7A46", "+"
@@ -2535,12 +2556,17 @@ if sec_usage is not None and _open(sec_usage):
     </div>
   </div>
   <div style="text-align:right">
-    <div style="font-size:14px;margin-bottom:6px"><b>{u["last7"]} из {n_allowed}</b> сотрудников зашли · {d0} – {today:%d.%m}</div>
-    <div style="font-size:13px;color:#7A8691">7 дней до этого — {pct_prev}% ({u["prev7"]} из {n_allowed})</div>
+    <div style="font-size:14px;margin-bottom:6px"><b>{came} из {n_allowed}</b> сотрудников зашли · {d0} – {today:%d.%m}</div>
+    <div style="font-size:14px;margin-bottom:6px">в среднем <b>{avg_days:.1f} из 5</b> рабочих дней</div>
+    <div style="font-size:13px;color:#7A8691">7 дней до этого — {pct_prev}% ({came_prev} из {n_allowed} заходили)</div>
   </div>
 </div>""", unsafe_allow_html=True)
-                st.caption("% = сотрудники, зашедшие за последние 7 дней ÷ все, кто "
-                           "хоть раз заходил в планер × 100.")
+                st.caption("% = рабочие дни со входом у всей команды за последние 7 дней "
+                           "÷ (5 × размер команды) × 100. 100% — каждый заходил каждый "
+                           "рабочий день; один человек, зашедший один раз, — это 1 из 5 "
+                           "дней, 20%. Команда — список в настройках плюс все, кто "
+                           "хоть раз заходил."
+                           + ("" if team else " Список команды пока не задан."))
 
             # ---------------- таблица: кто пользуется
             st.markdown("#### Кто пользуется дашбордом")
@@ -2642,12 +2668,20 @@ if sec_usage is not None and _open(sec_usage):
                 st.plotly_chart(fig, use_container_width=True)
 
             if n_allowed:
-                wk = u["weekly_allowed"].copy()
-                wk["week_start"] = pd.to_datetime(wk["week_start"])
-                wk = (wk.set_index("week_start").reindex(weeks, fill_value=0)
-                      .rename_axis("week_start").reset_index())
-                wk["pct"] = (100 * wk["users"] / n_allowed).round(0)
-                st.markdown("**% сотрудников со входом по неделям**")
+                wa = u["weekly_allowed"].copy()
+                wa["week_start"] = pd.to_datetime(wa["week_start"])
+                # в текущей неделе считаем только прошедшие рабочие дни
+                cur_week = today - pd.Timedelta(days=today.weekday())
+                cap_now = max(1, min(5, today.weekday() + 1))
+                wa["cap"] = wa["week_start"].map(lambda w: cap_now if w == cur_week else 5)
+                wa["days_c"] = wa[["days", "cap"]].min(axis=1)
+                agg = wa.groupby("week_start").agg(
+                    users=("email", "nunique"), days=("days_c", "sum"))
+                wk = (agg.reindex(weeks, fill_value=0).rename_axis("week_start")
+                      .reset_index())
+                caps = wk["week_start"].map(lambda w: cap_now if w == cur_week else 5)
+                wk["pct"] = (100 * wk["days"] / (caps * n_allowed)).round(0)
+                st.markdown("**% для Scorecard по неделям (регулярность)**")
                 _bars(wk["week_start"].dt.strftime("с %d.%m"), wk["pct"],
                       [f"{v:.0f}%" for v in wk["pct"]], ymax=115)
 
@@ -2659,12 +2693,15 @@ if sec_usage is not None and _open(sec_usage):
                 tbl["Неделя"] = (tbl["week_start"].dt.strftime("%d.%m") + " – "
                                  + (tbl["week_start"] + pd.Timedelta(days=6))
                                  .dt.strftime("%d.%m"))
-                tbl["Сотрудников"] = tbl["users"].astype(int)
+                tbl["Сотрудников зашло"] = tbl["users"].astype(int)
+                tbl["Рабочих дней со входом"] = tbl["days"].astype(int)
                 tbl["%"] = tbl["pct"].astype(int).astype(str) + "%"
-                st.dataframe(tbl[["Неделя", "Сотрудников", "%"]],
+                st.dataframe(tbl[["Неделя", "Сотрудников зашло",
+                                  "Рабочих дней со входом", "%"]],
                              hide_index=True, use_container_width=True)
-                st.caption(f"Неделя — с понедельника по воскресенье. База — "
-                           f"{n_allowed} сотрудников, кто хоть раз заходил.")
+                st.caption(f"Неделя — с понедельника по воскресенье, считаются рабочие "
+                           f"дни. Команда — {n_allowed} чел. Текущая неделя считается "
+                           f"по прошедшим рабочим дням.")
             else:
                 wk = u["weekly"].copy()
                 wk["week_start"] = pd.to_datetime(wk["week_start"])
