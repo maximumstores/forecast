@@ -203,6 +203,23 @@ def log_login(email: str) -> None:
         ).result()
         st.session_state["_login_logged"] = True
         log_event("tab", "Что делать → Внимание")   # стартовая вкладка
+    except Exception as exc:  # noqa: BLE001
+        st.session_state["_login_error"] = str(exc)
+        return
+    # каждый, кто хоть раз зашёл, автоматически попадает в список допущенных —
+    # это база для % в Scorecard. Отдельно ничего вести не нужно.
+    try:
+        client.query(f"""
+            CREATE TABLE IF NOT EXISTS `{ALLOWED_USERS}` (
+              email STRING NOT NULL, added_by STRING, added_at TIMESTAMP);
+            MERGE `{ALLOWED_USERS}` a
+            USING (SELECT DISTINCT LOWER(email) AS email FROM `{LOGIN_LOG}`
+                   WHERE LOWER(email) LIKE '%@{ALLOWED_DOMAIN}') l
+            ON LOWER(TRIM(a.email)) = l.email
+            WHEN NOT MATCHED THEN
+              INSERT (email, added_by, added_at)
+              VALUES (l.email, 'auto', CURRENT_TIMESTAMP());
+            """).result()
     except Exception:  # noqa: BLE001
         pass
 
@@ -2543,8 +2560,8 @@ if sec_usage is not None and _open(sec_usage):
 
             # ---------------- Scorecard
             if n_allowed == 0:
-                st.warning("Список допущенных пуст — % для Scorecard не посчитать. "
-                           "Добавьте сотрудников в блоке «Кто допущен» внизу вкладки.")
+                st.info("Список допущенных заполнится сам после следующего входа — "
+                        "туда попадает каждый, кто заходил в планер.")
             else:
                 pct = round(100 * u["last7"] / n_allowed)
                 pct_prev = round(100 * u["prev7"] / n_allowed)
@@ -2721,8 +2738,9 @@ if sec_usage is not None and _open(sec_usage):
             with st.expander("Кто допущен — база для % в Scorecard",
                              expanded=not u.get("allowed", pd.DataFrame()).shape[0]):
                 cur = u.get("allowed", pd.DataFrame(columns=["email"]))
-                st.caption("Сотрудники, которые должны пользоваться планером. "
-                           "По одной почте в строке; строку можно добавить или удалить.")
+                st.caption("Сюда автоматически попадает каждый, кто заходил в планер. "
+                           "Можно добавить тех, кто должен пользоваться, но ещё не "
+                           "заходил, — тогда они тоже войдут в базу для %.")
                 ed_allowed = st.data_editor(
                     cur.rename(columns={"email": "Почта"}), num_rows="dynamic",
                     hide_index=True, use_container_width=True, key="allowed_editor")
