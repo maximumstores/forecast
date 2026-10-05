@@ -2589,4 +2589,4 @@ if sec_usage is not None and _open(sec_usage):
                   .rename_axis("day").reset_index())
             st.markdown("**Входы по дням, 14 дней**")
             _bars(dl["day"].dt.strftime("%d.%m"), dl["logins"],
-                  [str(int(v)) if v else "" for v in dl["logins"]], color="#72B7B2")
+                  [str(int(v)) if v else "" for v in dl["logins"]], color="#72B7B2") 
