@@ -138,6 +138,7 @@ TZ = "Europe/Kiev"
 
 
 USAGE_EVENTS = f"{PROJECT}.forecast.usage_events"
+ALLOWED_USERS = f"{PROJECT}.forecast.allowed_users"
 
 
 @st.cache_resource
@@ -156,6 +157,11 @@ def ensure_usage_tables() -> bool:
           detail STRING
         )
         PARTITION BY DATE(ts);
+        CREATE TABLE IF NOT EXISTS `{ALLOWED_USERS}` (
+          email STRING NOT NULL,
+          added_by STRING,
+          added_at TIMESTAMP
+        );
         """).result()
     return True
 
@@ -2453,9 +2459,60 @@ def load_usage() -> dict:
         )
         WHERE updated_at >= {since_ts} AND author IS NOT NULL
         GROUP BY email, kind""")
+    try:
+        allowed = run(f"SELECT LOWER(TRIM(email)) AS email FROM `{ALLOWED_USERS}` "
+                      "WHERE TRIM(email) != '' GROUP BY 1 ORDER BY 1")
+    except Exception:  # noqa: BLE001
+        allowed = pd.DataFrame(columns=["email"])
+    # Scorecard: уникальные допущенные за 7 дней (включая сегодня) / все допущенные
+    # и то же самое за предыдущие 7 дней (8–14 дней назад) — для сравнения
+    if not allowed.empty:
+        cmp7 = run(f"""
+            SELECT
+              COUNT(DISTINCT IF(d >= DATE_SUB(CURRENT_DATE('{TZ}'), INTERVAL 6 DAY), e, NULL))
+                AS this7,
+              COUNT(DISTINCT IF(d <  DATE_SUB(CURRENT_DATE('{TZ}'), INTERVAL 6 DAY), e, NULL))
+                AS prev7
+            FROM (
+              SELECT LOWER(l.email) AS e, DATE(l.logged_in_at, '{TZ}') AS d
+              FROM `{LOGIN_LOG}` l
+              JOIN `{ALLOWED_USERS}` a ON LOWER(TRIM(a.email)) = LOWER(l.email)
+              WHERE DATE(l.logged_in_at, '{TZ}')
+                    >= DATE_SUB(CURRENT_DATE('{TZ}'), INTERVAL 13 DAY)
+            )""")
+        last7, prev7 = int(cmp7["this7"].iloc[0]), int(cmp7["prev7"].iloc[0])
+    else:
+        last7 = prev7 = 0
+    weekly_allowed = run(f"""
+        SELECT DATE_TRUNC(DATE(l.logged_in_at, '{TZ}'), WEEK(MONDAY)) AS week_start,
+               COUNT(DISTINCT LOWER(l.email)) AS users
+        FROM `{LOGIN_LOG}` l
+        JOIN `{ALLOWED_USERS}` a ON LOWER(TRIM(a.email)) = LOWER(l.email)
+        WHERE l.logged_in_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 63 DAY)
+        GROUP BY 1 ORDER BY 1""") if not allowed.empty else \
+        pd.DataFrame(columns=["week_start", "users"])
     return {"today": today, "period": period, "people": people,
             "weekly": weekly, "daily": daily, "sections": sections,
-            "opens": opens, "edits": edits}
+            "opens": opens, "edits": edits, "allowed": allowed,
+            "last7": last7, "prev7": prev7, "weekly_allowed": weekly_allowed}
+
+
+def save_allowed(emails: list[str]) -> int:
+    clean = sorted({e.strip().lower() for e in emails if e and e.strip()})
+    payload = pd.DataFrame({
+        "email": clean,
+        "added_by": author,
+        "added_at": dt.datetime.now(dt.timezone.utc),
+    })
+    client.load_table_from_dataframe(
+        payload, ALLOWED_USERS,
+        job_config=bigquery.LoadJobConfig(
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            schema=[bigquery.SchemaField("email", "STRING", mode="REQUIRED"),
+                    bigquery.SchemaField("added_by", "STRING"),
+                    bigquery.SchemaField("added_at", "TIMESTAMP")]),
+    ).result()
+    return len(clean)
 
 
 if sec_usage is not None and _open(sec_usage):
@@ -2478,6 +2535,46 @@ if sec_usage is not None and _open(sec_usage):
             people = u["people"].copy()
             total = int(people["logins"].sum()) or 1
 
+            today = pd.Timestamp(u["today"])        # сегодня по Киеву, из BigQuery
+            allowed = u["allowed"]["email"].tolist()
+            n_allowed = len(allowed)
+            weeks = pd.date_range(end=today - pd.Timedelta(days=today.weekday()),
+                                  periods=8, freq="W-MON")
+
+            # ---------------- Scorecard
+            if n_allowed == 0:
+                st.warning("Список допущенных пуст — % для Scorecard не посчитать. "
+                           "Добавьте сотрудников в блоке «Кто допущен» внизу вкладки.")
+            else:
+                pct = round(100 * u["last7"] / n_allowed)
+                pct_prev = round(100 * u["prev7"] / n_allowed)
+                delta = pct - pct_prev
+                if delta > 0:
+                    bg, fg, sign = "#E3F4EA", "#1E7A46", "+"
+                elif delta < 0:
+                    bg, fg, sign = "#FBE7E6", "#B3261E", ""
+                else:
+                    bg, fg, sign = "#EEF1F4", "#5A6B7A", "±"
+                d0 = (today - pd.Timedelta(days=6)).strftime("%d.%m")
+                st.markdown(f"""
+<div style="background:#F7F8F9;border-radius:12px;padding:22px 24px;display:flex;
+            justify-content:space-between;align-items:center;margin-bottom:8px">
+  <div>
+    <div style="font-size:14px;color:#5A6B7A;margin-bottom:8px">Для Scorecard — последние 7 дней</div>
+    <div style="display:flex;align-items:baseline;gap:10px">
+      <span style="font-size:44px;font-weight:600;line-height:1">{pct}%</span>
+      <span style="background:{bg};color:{fg};font-size:13px;font-weight:600;
+                   padding:3px 8px;border-radius:6px">{sign}{delta}%</span>
+    </div>
+  </div>
+  <div style="text-align:right">
+    <div style="font-size:14px;margin-bottom:6px"><b>{u["last7"]} из {n_allowed}</b> допущенных зашли · {d0} – {today:%d.%m}</div>
+    <div style="font-size:13px;color:#7A8691">7 дней до этого — {pct_prev}% ({u["prev7"]} из {n_allowed})</div>
+  </div>
+</div>""", unsafe_allow_html=True)
+                st.caption("% = уникальные сотрудники из списка допущенных, "
+                           "зашедшие за последние 7 дней ÷ все допущенные × 100.")
+
             # ---------------- таблица: кто пользуется
             st.markdown("#### Кто пользуется дашбордом")
             st.caption(
@@ -2485,10 +2582,16 @@ if sec_usage is not None and _open(sec_usage):
                 "процентов всех входов команды пришлось на человека. "
                 "«Активность» — в сколько процентов дней периода он заходил "
                 "хотя бы раз.")
+            missing = sorted(set(allowed) - set(people["email"].str.lower()))
+            if missing:
+                people = pd.concat([people, pd.DataFrame({
+                    "email": missing, "logins": 0, "active_days": 0,
+                    "last_login": pd.NaT})], ignore_index=True)
             people["who"] = people["email"].str.split("@").str[0]
             people["share"] = (100 * people["logins"] / total).round(0)
             people["activity"] = (100 * people["active_days"] / period).round(0)
-            people["last"] = pd.to_datetime(people["last_login"]).dt.strftime("%d.%m %H:%M")
+            people["last"] = (pd.to_datetime(people["last_login"]).dt.strftime("%d.%m %H:%M")
+                              .fillna("не заходил"))
             ed = u["edits"]
             saves = ed.groupby("email")["saves"].sum() if not ed.empty else pd.Series(dtype=int)
             opens = u["opens"].set_index("email")["tab_opens"] if not u["opens"].empty \
@@ -2571,16 +2674,38 @@ if sec_usage is not None and _open(sec_usage):
                                              rangemode="tozero"))
                 st.plotly_chart(fig, use_container_width=True)
 
-            today = pd.Timestamp(u["today"])        # сегодня по Киеву, из BigQuery
-            weeks = pd.date_range(end=today - pd.Timedelta(days=today.weekday()),
-                                  periods=8, freq="W-MON")
-            wk = u["weekly"].copy()
-            wk["week_start"] = pd.to_datetime(wk["week_start"])
-            wk = (wk.set_index("week_start").reindex(weeks, fill_value=0)
-                  .rename_axis("week_start").reset_index())
-            st.markdown("**Сотрудников со входом по неделям**")
-            _bars(wk["week_start"].dt.strftime("с %d.%m"), wk["unique_users"],
-                  [str(int(v)) if v else "" for v in wk["unique_users"]])
+            if n_allowed:
+                wk = u["weekly_allowed"].copy()
+                wk["week_start"] = pd.to_datetime(wk["week_start"])
+                wk = (wk.set_index("week_start").reindex(weeks, fill_value=0)
+                      .rename_axis("week_start").reset_index())
+                wk["pct"] = (100 * wk["users"] / n_allowed).round(0)
+                st.markdown("**% допущенных со входом по неделям**")
+                _bars(wk["week_start"].dt.strftime("с %d.%m"), wk["pct"],
+                      [f"{v:.0f}%" for v in wk["pct"]], ymax=115)
+
+                st.markdown("#### % для Scorecard по неделям")
+                tbl = wk.copy()
+                if (tbl["users"] > 0).any():             # недели до начала журнала не показываем
+                    tbl = tbl[tbl["week_start"] >= tbl.loc[tbl["users"] > 0, "week_start"].min()]
+                tbl = tbl.sort_values("week_start", ascending=False)
+                tbl["Неделя"] = (tbl["week_start"].dt.strftime("%d.%m") + " – "
+                                 + (tbl["week_start"] + pd.Timedelta(days=6))
+                                 .dt.strftime("%d.%m"))
+                tbl["Сотрудников"] = tbl["users"].astype(int)
+                tbl["%"] = tbl["pct"].astype(int).astype(str) + "%"
+                st.dataframe(tbl[["Неделя", "Сотрудников", "%"]],
+                             hide_index=True, use_container_width=True)
+                st.caption(f"Неделя — с понедельника по воскресенье. База — "
+                           f"{n_allowed} допущенных сейчас.")
+            else:
+                wk = u["weekly"].copy()
+                wk["week_start"] = pd.to_datetime(wk["week_start"])
+                wk = (wk.set_index("week_start").reindex(weeks, fill_value=0)
+                      .rename_axis("week_start").reset_index())
+                st.markdown("**Сотрудников со входом по неделям**")
+                _bars(wk["week_start"].dt.strftime("с %d.%m"), wk["unique_users"],
+                      [str(int(v)) if v else "" for v in wk["unique_users"]])
 
             days = pd.date_range(end=today, periods=14, freq="D")
             dl = u["daily"].copy()
@@ -2589,4 +2714,26 @@ if sec_usage is not None and _open(sec_usage):
                   .rename_axis("day").reset_index())
             st.markdown("**Входы по дням, 14 дней**")
             _bars(dl["day"].dt.strftime("%d.%m"), dl["logins"],
-                  [str(int(v)) if v else "" for v in dl["logins"]], color="#72B7B2") 
+                  [str(int(v)) if v else "" for v in dl["logins"]], color="#72B7B2")
+
+        # ---------------- кто допущен
+        if u is not None:
+            with st.expander("Кто допущен — база для % в Scorecard",
+                             expanded=not u.get("allowed", pd.DataFrame()).shape[0]):
+                cur = u.get("allowed", pd.DataFrame(columns=["email"]))
+                st.caption("Сотрудники, которые должны пользоваться планером. "
+                           "По одной почте в строке; строку можно добавить или удалить.")
+                ed_allowed = st.data_editor(
+                    cur.rename(columns={"email": "Почта"}), num_rows="dynamic",
+                    hide_index=True, use_container_width=True, key="allowed_editor")
+                if st.button("Сохранить список", key="allowed_save"):
+                    emails = [str(e) for e in ed_allowed["Почта"].dropna()]
+                    bad = [e for e in emails if e.strip() and
+                           not e.strip().lower().endswith("@" + ALLOWED_DOMAIN)]
+                    if bad:
+                        st.error("Не из домена: " + ", ".join(bad))
+                    else:
+                        n = save_allowed(emails)
+                        load_usage.clear()
+                        st.success(f"Сохранено: {n} сотрудников")
+                        st.rerun()
