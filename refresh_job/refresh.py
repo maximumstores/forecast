@@ -57,7 +57,7 @@ SHEET_HOPTED = "16AjBg-FziOJj7qE34y9KACWMPLjiHUv3B0BDebgaI4Q"   # сюда пи�
 #                    вернули #REF! и кавычки внутри полей стоят непарно
 SOURCES = [
     # table,                          doc,                sheet,                          mode,     quote, nl,    width
-    ("mt.sales_us_fact_native",       SHEET_SALES,        "2127822292",                   "auto",   '"',   False, None),
+    ("mt.sales_us_fact_native",       SHEET_SALES,        "2127822292",                   "auto",   '"',   True, None),
     ("mt.sales_oos_amz_native",       SHEET_SALES,        "404969167",                    "auto",   "",    False, None),
     ("mt.sales_plus_oos_native",      SHEET_SALES,        "1547531617",                   "auto",   "",    False, None),
     ("mt.SPR_native",                 SHEET_SPR,          "2096733449",                   "auto",   '"',   True,  None),
@@ -454,4 +454,4 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as exc:  # noqa: BLE001
         log.error("Обновление не прошло: %s", exc)
-        sys.exit(1)
+        sys.exit(1) 
