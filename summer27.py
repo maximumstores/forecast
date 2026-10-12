@@ -420,7 +420,10 @@ def flag(r) -> str:
         return ""
     out = []
     yoy = r.yoy if not np.isnan(r.yoy) else None
-    if not np.isnan(r.g27):
+    if r.F25 == 0 and not np.isnan(r.g27):
+        # запущена в '26: прошлогоднего роста нет, сравнивать можно только с фактом '26
+        out.append("🟠 запуск '26, прогноз ×2+" if r.g27 > 1.0 else "🆕 запуск '26")
+    elif not np.isnan(r.g27):
         limit = max(yoy or 0, 0) * 1.5 + 0.2
         if r.g27 > 0.5 and r.g27 > limit:
             out.append("🔴 рост выше тренда")
@@ -539,7 +542,7 @@ def render(client, author, log_event, tab_intro, num) -> None:
     view = G.copy()
     if only_flag:
         view = view[view["flag"] != ""]
-    view["_ord"] = view["flag"].str.startswith("🔴").map({True: 0, False: 1})
+    view["_ord"] = np.select([view["flag"].str.startswith("🔴"), view["flag"].str.startswith("🟠")], [0, 1], 2)
     view = view.sort_values(["_ord", "P27"], ascending=[True, False])
 
     st.markdown(f"#### Группы — {COUNTRY_LABEL.get(country, country)}")
