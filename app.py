@@ -1069,7 +1069,7 @@ else:
 st.caption(f"Данные BigQuery · {scope}")
 
 is_admin = True              # вкладку «Использование» видят все сотрудники
-_sections = ["Что делать", "Данные", "Планирование", "Сверка"]
+_sections = ["Что делать", "Данные", "Планирование", "Сверка", "Лето '27"]
 if is_admin:
     _sections.append("Активность дашборда")
 # Разделы и подразделы. Каждое переключение пишется в журнал событий:
@@ -1095,8 +1095,8 @@ def _on_tab(key: str, section: str | None = None) -> None:
 
 
 _sec = st.tabs(_sections, key="nav_top", on_change=_on_tab, args=("nav_top",))
-sec_act, sec_data, sec_plan, sec_check = _sec[:4]
-sec_usage = _sec[4] if is_admin else None
+sec_act, sec_data, sec_plan, sec_check, sec_summer = _sec[:5]
+sec_usage = _sec[5] if is_admin else None
 
 
 def _subtabs(section: str):
@@ -2490,6 +2490,13 @@ def load_usage() -> dict:
             "weekly": weekly, "daily": daily, "sections": sections,
             "opens": opens, "edits": edits, "allowed": allowed,
             "reg": reg, "weekly_allowed": weekly_allowed}
+
+
+# ------------------------------------------------------------------ лето '27
+if _open(sec_summer):
+    with sec_summer:
+        import summer27
+        summer27.render(client, author, log_event, tab_intro, num)
 
 
 if sec_usage is not None and _open(sec_usage):
