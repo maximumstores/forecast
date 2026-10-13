@@ -42,6 +42,8 @@ MONTH_SHORT = ["янв", "фев", "мар", "апр", "май", "июн", "ию
 
 C25, C26, CP26, CP27, CTR = "#9AA8B5", "#2F6FB2", "#7FB0E0", "#C8752B", "#5E9C6A"
 
+NINA_COLS = ("nina_f25", "nina_f26", "nina_fc27", "nina_stock", "nina_order", "nina_oos", "nina_inc")
+
 STATUSES = ["—", "согласовано", "под вопросом", "снизить", "повысить"]
 
 
@@ -116,6 +118,11 @@ def map_columns(header: list) -> dict:
         "nina_f25": first(lambda x, k: k.startswith("фактпродаж25")),
         "nina_f26": first(lambda x, k: k.startswith("фактпродаж26")),
         "nina_fc27": first(lambda x, k: k.startswith("прогнозпродаж27")),
+        # колонки сводной «Order» у Нины: остатки, заказ, OOS, приход
+        "nina_stock": first(lambda x, k: k.startswith("расчетныеостаткина1числомесяцазаказа")),
+        "nina_order": first(lambda x, k: k == "заказ"),
+        "nina_oos": first(lambda x, k: k.startswith("oos") and "/" not in k and "ago" not in k),
+        "nina_inc": first(lambda x, k: k.startswith("приходпослерасчетазаказа")),
     }
 
     # факт продаж: первый непрерывный блок «янв.2025 … дек.2026»
@@ -197,7 +204,7 @@ def fetch_country(sess, country: str, sheet_id: str) -> tuple[pd.DataFrame, dict
         raise RuntimeError(f"{country}: не нашёл колонки {missing or 'факта продаж'} в «{SHEET}»")
 
     wanted: dict[str, int] = {}
-    for k in ("asin", "old_asin", "grp", "category", "color", "nina_f25", "nina_f26", "nina_fc27"):
+    for k in ("asin", "old_asin", "grp", "category", "color") + NINA_COLS:
         if cols[k] is not None:
             wanted[k] = cols[k]
     for kind in ("fact", "plan26", "plan27"):
@@ -253,7 +260,7 @@ def fetch_country(sess, country: str, sheet_id: str) -> tuple[pd.DataFrame, dict
         "fact_months": len(cols["fact"]),
         "plan26_months": len(cols["plan26"]),
         "plan27_months": len(cols["plan27"]),
-        "nina_cols": [k for k in ("nina_f25", "nina_f26", "nina_fc27") if cols[k] is not None],
+        "nina_cols": [k for k in NINA_COLS if cols[k] is not None],
     }
     return long, info
 
@@ -355,9 +362,25 @@ def load_season(_client) -> pd.DataFrame:
           SUM(IF(kind='nina_f25',  units, 0)) AS n25,
           SUM(IF(kind='nina_f26',  units, 0)) AS n26,
           SUM(IF(kind='nina_fc27', units, 0)) AS n27,
+          SUM(IF(kind='nina_stock', units, 0)) AS n_stock,
+          SUM(IF(kind='nina_order', units, 0)) AS n_order,
+          SUM(IF(kind='nina_oos',   units, 0)) AS n_oos,
+          SUM(IF(kind='nina_inc',   units, 0)) AS n_inc,
+          SUM(IF(kind='plan27' AND EXTRACT(YEAR FROM month)=2027 AND EXTRACT(MONTH FROM month) BETWEEN 5 AND 8, units, 0)) AS p27ma,
           MAX(loaded_at) AS loaded_at,
           FORMAT_TIMESTAMP('%d.%m %H:%M', MAX(loaded_at), 'Europe/Kiev') AS loaded_txt
         FROM `{SRC}` GROUP BY 1,2,3,4""")
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_planner(_client) -> pd.DataFrame:
+    """Прогноз нашего планера (только US) на май–август '27 по ASIN.
+    Горизонт планера — 12 месяцев, сентябрь '27 в него пока не входит."""
+    return _q(_client, f"""
+        SELECT asin, SUM(plan_units) AS pl27ma
+        FROM `{PROJECT}.forecast.plan_sales`
+        WHERE month BETWEEN '2027-05-01' AND '2027-08-01' AND asin IS NOT NULL
+        GROUP BY asin""")
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -395,7 +418,13 @@ def save_review(client, country, grp, color, new_plan27, status, comment, author
 
 # ------------------------------------------------------------------ расчёты
 def summarize(df: pd.DataFrame, by: list[str], use_nina: bool) -> pd.DataFrame:
-    g = df.groupby(by, dropna=False)[["f25", "f26", "p26", "p27", "w25", "w26", "n25", "n26", "n27"]].sum().reset_index()
+    cols = ["f25", "f26", "p26", "p27", "w25", "w26", "n25", "n26", "n27",
+            "n_stock", "n_order", "n_oos", "n_inc", "p27ma", "pl27ma"]
+    df = df.copy()
+    for c in cols:
+        if c not in df:
+            df[c] = 0.0
+    g = df.groupby(by, dropna=False)[cols].sum().reset_index()
     if use_nina:
         # итоги как в сводной «Order» у Нины, если в файле есть её колонки
         g["F25"] = np.where(g["n25"] != 0, g["n25"], g["f25"])
@@ -498,8 +527,17 @@ def render(client, author, log_event, tab_intro, num) -> None:
     countries = [c for c in SOURCES if c in set(season["country"])]
     country = st.radio("Страна", countries, horizontal=True, key="s27_country",
                        format_func=lambda c: COUNTRY_LABEL.get(c, c))
-    sdf = season[season["country"] == country]
+    sdf = season[season["country"] == country].copy()
     has_nina = (sdf[["n25", "n26", "n27"]].abs().sum() > 0).all()
+    has_order = bool(sdf[["n_stock", "n_order"]].abs().sum().sum() > 0) if "n_order" in sdf else False
+    has_planner = False
+    if country == "US":
+        try:
+            pl = load_planner(client)
+            sdf["pl27ma"] = sdf["asin"].map(pl.set_index("asin")["pl27ma"]).fillna(0.0)
+            has_planner = bool(sdf["pl27ma"].sum() > 0)
+        except Exception:  # noqa: BLE001
+            has_planner = False
 
     f1, f2, f3 = st.columns([2, 3, 1.3])
     cats = f1.multiselect("Категория", sorted(x for x in sdf["category"].dropna().unique() if x), key="s27_cat")
@@ -549,16 +587,26 @@ def render(client, author, log_event, tab_intro, num) -> None:
     st.caption(
         "Факт и прогноз — сумма за май–сентябрь. «Ориентир '27» = факт '26 × рост '26/'25 "
         "(рост ограничен −30%…+100%) — нейтральная точка для разговора, а не план. "
+        "«Планер май–авг» — прогноз нашего планера (только US; сентябрь '27 в его горизонт пока не входит), "
+        "рядом — план Нины за те же месяцы. "
         "«Зима '26/'25» — рост продаж за янв–мар: если он слабый, а прогноз лета сильный, это повод спросить почему."
     )
-    show = pd.DataFrame({
-        "Группа": view["grp"],
-        "Флаг": view["flag"],
+    # порядок колонок — как в сводной «order» у Нины, плюс наши колонки для сверки
+    cols = {"Группа": view["grp"], "Флаг": view["flag"],
+            "Факт '26": view["F26"], "Прогноз '27 (Нина)": view["P27"]}
+    if has_planner:
+        cols["Нина май–авг"] = view["p27ma"]
+        cols["Планер май–авг"] = view["pl27ma"]
+        cols["Планер к Нине"] = np.where(view["p27ma"] > 0, view["pl27ma"] / view["p27ma"] - 1, np.nan)
+    if has_order:
+        cols["Расч. остатки"] = view["n_stock"]
+        cols["Заказ"] = view["n_order"]
+        cols["OOS '25"] = view["n_oos"]
+        cols["Приход после заказа"] = view["n_inc"]
+    cols.update({
         "Факт '25": view["F25"],
-        "Факт '26": view["F26"],
-        "Рост '26": view["yoy"],
-        "Прогноз '27": view["P27"],
-        "Рост '27": view["g27"],
+        "Рост факт '26/'25": view["yoy"],
+        "Рост прогноз/факт '26": view["g27"],
         "Ориентир '27": view["trend27"],
         "Зима '26/'25": view["wyoy"],
         "Правка '27": view["Правка '27"],
@@ -566,14 +614,17 @@ def render(client, author, log_event, tab_intro, num) -> None:
         "💬": view["💬"],
         "Комментарий": view["Комментарий"],
     })
+    show = pd.DataFrame(cols)
     pc = st.column_config.NumberColumn(format="percent")
     nc = st.column_config.NumberColumn(format="localized")
     st.dataframe(
         show, hide_index=True, width="stretch", height=min(620, 38 + 35 * len(show)),
         column_config={
-            "Факт '25": nc, "Факт '26": nc, "Прогноз '27": nc,
-            "Ориентир '27": nc, "Правка '27": nc,
-            "Рост '26": pc, "Рост '27": pc, "Зима '26/'25": pc,
+            **{c: nc for c in ("Факт '25", "Факт '26", "Прогноз '27 (Нина)", "Нина май–авг",
+                               "Планер май–авг", "Расч. остатки", "Заказ", "OOS '25",
+                               "Приход после заказа", "Ориентир '27", "Правка '27")},
+            **{c: pc for c in ("Планер к Нине", "Рост факт '26/'25", "Рост прогноз/факт '26",
+                               "Зима '26/'25")},
             "Комментарий": st.column_config.TextColumn(width="medium"),
         },
     )
