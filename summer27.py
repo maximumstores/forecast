@@ -599,6 +599,9 @@ def render(client, author, log_event, tab_intro, num) -> None:
         G["a27"] = G["grp"].map(a["a27"])
         G["a_lo"] = G["grp"].map(a["a_lo"])
         G["a_hi"] = G["grp"].map(a["a_hi"])
+        # группа без истории (новинка): ARIMA = 0, сравнивать не с чем
+        no_hist = G["a_hi"].fillna(0) <= 0
+        G.loc[no_hist, ["a27", "a_lo", "a_hi"]] = np.nan
         above = G["a_hi"].notna() & (G["P27"] > G["a_hi"])
         G.loc[above, "flag"] = G.loc[above, "flag"].map(
             lambda f: (f + " · " if f else "") + "📈 выше коридора ARIMA")
