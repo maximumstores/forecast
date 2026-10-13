@@ -115,6 +115,7 @@ def map_columns(header: list) -> dict:
         "grp": first(lambda x, k: k == "category+parent"),
         "category": first(lambda x, k: k == "категории"),
         "color": first(lambda x, k: k == "chinacolors"),
+        "reorder": first(lambda x, k: k.startswith("reorder")),   # «Reorder US/DE/…»: Да / Нет
         "nina_f25": first(lambda x, k: k.startswith("фактпродаж25")),
         "nina_f26": first(lambda x, k: k.startswith("фактпродаж26")),
         "nina_fc27": first(lambda x, k: k.startswith("прогнозпродаж27")),
@@ -204,7 +205,7 @@ def fetch_country(sess, country: str, sheet_id: str) -> tuple[pd.DataFrame, dict
         raise RuntimeError(f"{country}: не нашёл колонки {missing or 'факта продаж'} в «{SHEET}»")
 
     wanted: dict[str, int] = {}
-    for k in ("asin", "old_asin", "grp", "category", "color") + NINA_COLS:
+    for k in ("asin", "old_asin", "grp", "category", "color", "reorder") + NINA_COLS:
         if cols[k] is not None:
             wanted[k] = cols[k]
     for kind in ("fact", "plan26", "plan27"):
@@ -236,6 +237,7 @@ def fetch_country(sess, country: str, sheet_id: str) -> tuple[pd.DataFrame, dict
         "grp": txt(raw["grp"]),
         "category": txt(raw["category"]) if "category" in raw else "",
         "color": txt(raw["color"]) if "color" in raw else "",
+        "reorder": txt(raw["reorder"]) if "reorder" in raw else "",
     })
     keep = (ident["asin"] != "") & (ident["grp"] != "") & (ident["asin"].str.lower() != "asin")
     ident = ident[keep]
@@ -243,7 +245,7 @@ def fetch_country(sess, country: str, sheet_id: str) -> tuple[pd.DataFrame, dict
 
     rows = []
     for name in names:
-        if name in ("asin", "old_asin", "grp", "category", "color"):
+        if name in ("asin", "old_asin", "grp", "category", "color", "reorder"):
             continue
         vals = raw[name].map(_num)
         if "|" in name:
@@ -286,6 +288,7 @@ def refresh_all(client: bigquery.Client) -> dict:
         bigquery.SchemaField("grp", "STRING"),
         bigquery.SchemaField("category", "STRING"),
         bigquery.SchemaField("color", "STRING"),
+        bigquery.SchemaField("reorder", "STRING"),
         bigquery.SchemaField("kind", "STRING"),
         bigquery.SchemaField("month", "DATE"),
         bigquery.SchemaField("units", "FLOAT"),
@@ -302,6 +305,8 @@ def refresh_all(client: bigquery.Client) -> dict:
                     bigquery.ArrayQueryParameter("c", "STRING", failed)]),
             ).result().to_dataframe()
             if not old.empty:
+                if "reorder" not in old:
+                    old["reorder"] = ""
                 df = pd.concat([df, old[df.columns]], ignore_index=True)
         except Exception:  # noqa: BLE001
             pass
@@ -353,6 +358,7 @@ def load_season(_client) -> pd.DataFrame:
     return _q(_client, f"""
         SELECT country, grp, IFNULL(NULLIF(color,''),'—') AS color, asin,
                ANY_VALUE(category) AS category, ANY_VALUE(old_asin) AS old_asin,
+               IFNULL(ANY_VALUE(reorder), '') AS reorder,
           SUM(IF(kind='fact'   AND EXTRACT(YEAR FROM month)=2025 AND EXTRACT(MONTH FROM month) BETWEEN 5 AND 9, units, 0)) AS f25,
           SUM(IF(kind='fact'   AND EXTRACT(YEAR FROM month)=2026 AND EXTRACT(MONTH FROM month) BETWEEN 5 AND 9, units, 0)) AS f26,
           SUM(IF(kind='plan26' AND EXTRACT(YEAR FROM month)=2026 AND EXTRACT(MONTH FROM month) BETWEEN 5 AND 9, units, 0)) AS p26,
@@ -547,6 +553,12 @@ def render(client, author, log_event, tab_intro, num) -> None:
     if grps_pick:
         sdf = sdf[sdf["grp"].isin(grps_pick)]
     only_flag = f3.toggle("Только с флагами", key="s27_onlyflag")
+    if "reorder" in sdf and (sdf["reorder"].str.lower() == "да").any():
+        only_reorder = st.toggle("Только «Reorder = Да» — как в сводной order у Нины", value=True,
+                                 key="s27_reorder",
+                                 help="Строки «Нет» — снятые с заказа и старые ASIN. Нина их в сводную не берёт.")
+        if only_reorder:
+            sdf = sdf[sdf["reorder"].str.lower() == "да"]
 
     rev = load_reviews(client)
     last = latest_reviews(rev)
