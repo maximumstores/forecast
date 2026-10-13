@@ -390,6 +390,26 @@ def load_planner(_client) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600, show_spinner=False)
+def load_arima(_client) -> pd.DataFrame:
+    """ARIMA по группам (только US) на май–сентябрь '27 с 80% коридором.
+    Считается каждую ночь в sp_refresh_gold (forecast.group_forecast_long, горизонт 18 мес)."""
+    return _q(_client, f"""
+        SELECT group_key AS grp, SUM(units_forecast) AS a27, SUM(lo_80) AS a_lo, SUM(hi_80) AS a_hi
+        FROM `{PROJECT}.forecast.group_forecast_long`
+        WHERE month BETWEEN '2027-05-01' AND '2027-09-01'
+        GROUP BY 1""")
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_arima_monthly(_client, grp: str) -> pd.DataFrame:
+    return _q(_client, f"""
+        SELECT month, units_forecast, lo_80, hi_80
+        FROM `{PROJECT}.forecast.group_forecast_long`
+        WHERE group_key = @g ORDER BY month""",
+              [bigquery.ScalarQueryParameter("g", "STRING", grp)])
+
+
+@st.cache_data(ttl=600, show_spinner=False)
 def load_monthly(_client, country: str, grp: str, color: str | None) -> pd.DataFrame:
     params = [bigquery.ScalarQueryParameter("c", "STRING", country),
               bigquery.ScalarQueryParameter("g", "STRING", grp),
@@ -536,14 +556,13 @@ def render(client, author, log_event, tab_intro, num) -> None:
     sdf = season[season["country"] == country].copy()
     has_nina = (sdf[["n25", "n26", "n27"]].abs().sum() > 0).all()
     has_order = bool(sdf[["n_stock", "n_order"]].abs().sum().sum() > 0) if "n_order" in sdf else False
-    has_planner = False
+    arima = pd.DataFrame()
     if country == "US":
         try:
-            pl = load_planner(client)
-            sdf["pl27ma"] = sdf["asin"].map(pl.set_index("asin")["pl27ma"]).fillna(0.0)
-            has_planner = bool(sdf["pl27ma"].sum() > 0)
+            arima = load_arima(client)
         except Exception:  # noqa: BLE001
-            has_planner = False
+            arima = pd.DataFrame()
+    has_arima = not arima.empty
 
     f1, f2, f3 = st.columns([2, 3, 1.3])
     cats = f1.multiselect("Категория", sorted(x for x in sdf["category"].dropna().unique() if x), key="s27_cat")
@@ -575,16 +594,30 @@ def render(client, author, log_event, tab_intro, num) -> None:
     else:
         G["Правка '27"], G["Статус"], G["Комментарий"], G["💬"] = np.nan, "", "", 0
     G["Итог '27"] = G["Правка '27"].fillna(G["P27"])
+    if has_arima:
+        a = arima.set_index("grp")
+        G["a27"] = G["grp"].map(a["a27"])
+        G["a_lo"] = G["grp"].map(a["a_lo"])
+        G["a_hi"] = G["grp"].map(a["a_hi"])
+        above = G["a_hi"].notna() & (G["P27"] > G["a_hi"])
+        G.loc[above, "flag"] = G.loc[above, "flag"].map(
+            lambda f: (f + " · " if f else "") + "📈 выше коридора ARIMA")
 
     # ---------------- итоги страны
     T = G[["F25", "F26", "P27", "Итог '27"]].sum()
     m = st.columns(5)
     m[0].metric(f"Факт '25, {SEASON_TXT}", num(T["F25"]))
     m[1].metric("Факт '26", num(T["F26"]), _pct(T["F26"] / T["F25"] - 1 if T["F25"] else np.nan) + " к '25")
-    m[2].metric("Ориентир '27 по тренду", num(G["trend27"].sum()),
-                _pct(G["trend27"].sum() / T["F26"] - 1 if T["F26"] else np.nan) + " к '26",
-                help="Факт '26 × рост '26/'25 по каждой группе (рост ограничен −30%…+100%). "
-                     "Нейтральная точка для разговора, не план.")
+    if has_arima:
+        a_sum = G["a27"].sum()
+        m[2].metric("ARIMA '27", num(a_sum), _pct(a_sum / T["F26"] - 1 if T["F26"] else np.nan) + " к '26",
+                    help="Статистический прогноз BigQuery ARIMA_PLUS по истории продаж каждой группы "
+                         "(спрос с поправкой на OOS), май–сентябрь '27.")
+    else:
+        m[2].metric("Ориентир '27 по тренду", num(G["trend27"].sum()),
+                    _pct(G["trend27"].sum() / T["F26"] - 1 if T["F26"] else np.nan) + " к '26",
+                    help="Факт '26 × рост '26/'25 по каждой группе (рост ограничен −30%…+100%). "
+                         "Нейтральная точка для разговора, не план.")
     m[3].metric("Прогноз '27", num(T["P27"]), _pct(T["P27"] / T["F26"] - 1 if T["F26"] else np.nan) + " к '26")
     m[4].metric("С правками", num(T["Итог '27"]),
                 _pct(T["Итог '27"] / T["P27"] - 1 if T["P27"] else np.nan) + " к прогнозу")
@@ -599,17 +632,17 @@ def render(client, author, log_event, tab_intro, num) -> None:
     st.caption(
         "Факт и прогноз — сумма за май–сентябрь. «Ориентир '27» = факт '26 × рост '26/'25 "
         "(рост ограничен −30%…+100%) — нейтральная точка для разговора, а не план. "
-        "«Планер май–авг» — прогноз нашего планера (только US; сентябрь '27 в его горизонт пока не входит), "
-        "рядом — план Нины за те же месяцы. "
+        "«ARIMA '27» — статистический прогноз по истории продаж группы (только US), с 80% коридором; "
+        "📈 — план Нины выше верхней границы коридора. "
         "«Зима '26/'25» — рост продаж за янв–мар: если он слабый, а прогноз лета сильный, это повод спросить почему."
     )
     # порядок колонок — как в сводной «order» у Нины, плюс наши колонки для сверки
     cols = {"Группа": view["grp"], "Флаг": view["flag"],
             "Факт '26": view["F26"], "Прогноз '27 (Нина)": view["P27"]}
-    if has_planner:
-        cols["Нина май–авг"] = view["p27ma"]
-        cols["Планер май–авг"] = view["pl27ma"]
-        cols["Планер к Нине"] = np.where(view["p27ma"] > 0, view["pl27ma"] / view["p27ma"] - 1, np.nan)
+    if has_arima:
+        cols["ARIMA '27"] = view["a27"]
+        cols["ARIMA 80%"] = [f"{num(lo)}–{num(hi)}" if pd.notna(lo) else "" for lo, hi in zip(view["a_lo"], view["a_hi"])]
+        cols["Нина к ARIMA"] = np.where(view["a27"] > 0, view["P27"] / view["a27"] - 1, np.nan)
     if has_order:
         cols["Расч. остатки"] = view["n_stock"]
         cols["Заказ"] = view["n_order"]
@@ -632,10 +665,10 @@ def render(client, author, log_event, tab_intro, num) -> None:
     st.dataframe(
         show, hide_index=True, width="stretch", height=min(620, 38 + 35 * len(show)),
         column_config={
-            **{c: nc for c in ("Факт '25", "Факт '26", "Прогноз '27 (Нина)", "Нина май–авг",
-                               "Планер май–авг", "Расч. остатки", "Заказ", "OOS '25",
+            **{c: nc for c in ("Факт '25", "Факт '26", "Прогноз '27 (Нина)", "ARIMA '27",
+                               "Расч. остатки", "Заказ", "OOS '25",
                                "Приход после заказа", "Ориентир '27", "Правка '27")},
-            **{c: pc for c in ("Планер к Нине", "Рост факт '26/'25", "Рост прогноз/факт '26",
+            **{c: pc for c in ("Нина к ARIMA", "Рост факт '26/'25", "Рост прогноз/факт '26",
                                "Зима '26/'25")},
             "Комментарий": st.column_config.TextColumn(width="medium"),
         },
@@ -659,7 +692,13 @@ def render(client, author, log_event, tab_intro, num) -> None:
     color = None if csel == "вся группа" else csel
 
     mon = load_monthly(client, country, gsel, color)
-    st.plotly_chart(monthly_chart(mon, gsel, color), width="stretch", key=f"s27_chart_{country}")
+    ar_m = pd.DataFrame()
+    if has_arima and color is None:
+        try:
+            ar_m = load_arima_monthly(client, gsel)
+        except Exception:  # noqa: BLE001
+            ar_m = pd.DataFrame()
+    st.plotly_chart(monthly_chart(mon, gsel, color, ar_m), width="stretch", key=f"s27_chart_{country}")
 
     left, right = st.columns([3, 2])
     with left:
@@ -718,7 +757,8 @@ def render(client, author, log_event, tab_intro, num) -> None:
                             unsafe_allow_html=True)
 
 
-def monthly_chart(mon: pd.DataFrame, grp: str, color: str | None) -> go.Figure:
+def monthly_chart(mon: pd.DataFrame, grp: str, color: str | None,
+                  ar: pd.DataFrame | None = None) -> go.Figure:
     fig = go.Figure()
     if mon.empty:
         return fig
@@ -736,8 +776,20 @@ def monthly_chart(mon: pd.DataFrame, grp: str, color: str | None) -> go.Figure:
                              line=dict(color=C25, width=2)))
     fig.add_trace(go.Scatter(x=x, y=series("fact", 2026), name="Факт '26", mode="lines+markers",
                              line=dict(color=C26, width=3)))
-    fig.add_trace(go.Scatter(x=x, y=series("plan27", 2027), name="Прогноз '27", mode="lines+markers",
+    fig.add_trace(go.Scatter(x=x, y=series("plan27", 2027), name="План Нины '27", mode="lines+markers",
                              line=dict(color=CP27, width=3, dash="dash")))
+    if ar is not None and not ar.empty:
+        a = ar.copy()
+        a["month"] = pd.to_datetime(a["month"])
+        a = a[a["month"].dt.year == 2027]
+        a = a.set_index(a["month"].dt.month)
+        pick = lambda col: [float(a[col].get(i)) if i in a.index else None for i in range(1, 13)]  # noqa: E731
+        fig.add_trace(go.Scatter(x=x, y=pick("hi_80"), mode="lines", line=dict(width=0),
+                                 showlegend=False, hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=x, y=pick("lo_80"), mode="lines", line=dict(width=0), fill="tonexty",
+                                 fillcolor="rgba(94,156,106,0.15)", name="ARIMA 80%", hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=x, y=pick("units_forecast"), name="ARIMA '27", mode="lines+markers",
+                                 line=dict(color=CTR, width=2)))
     fig.update_layout(
         height=340, margin=dict(l=10, r=10, t=40, b=10),
         title=dict(text=f"{grp}" + (f" / {color}" if color else "") + " — по месяцам, шт", font=dict(size=14)),
