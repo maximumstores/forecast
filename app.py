@@ -2495,7 +2495,15 @@ def load_usage() -> dict:
 # ------------------------------------------------------------------ лето '27
 if _open(sec_summer):
     with sec_summer:
+        import importlib
+        import os
         import summer27
+        # Streamlit Cloud при обновлении из GitHub перезапускает app.py, но уже
+        # импортированный модуль не перечитывает — перечитываем сами, если файл изменился.
+        _mtime = os.path.getmtime(summer27.__file__)
+        if getattr(summer27, "_loaded_mtime", None) != _mtime:
+            summer27 = importlib.reload(summer27)
+            summer27._loaded_mtime = _mtime
         summer27.render(client, author, log_event, tab_intro, num)
 
 
