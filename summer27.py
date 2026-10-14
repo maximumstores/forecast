@@ -394,7 +394,8 @@ def load_arima(_client) -> pd.DataFrame:
     """ARIMA по группам (только US) на май–сентябрь '27 с 80% коридором.
     Считается каждую ночь в sp_refresh_gold (forecast.group_forecast_long, горизонт 18 мес)."""
     return _q(_client, f"""
-        SELECT group_key AS grp, SUM(units_forecast) AS a27, SUM(lo_80) AS a_lo, SUM(hi_80) AS a_hi
+        SELECT group_key AS grp, SUM(GREATEST(units_forecast, 0)) AS a27,
+               SUM(GREATEST(lo_80, 0)) AS a_lo, SUM(GREATEST(hi_80, 0)) AS a_hi
         FROM `{PROJECT}.forecast.group_forecast_long`
         WHERE month BETWEEN '2027-05-01' AND '2027-09-01'
         GROUP BY 1""")
@@ -403,7 +404,8 @@ def load_arima(_client) -> pd.DataFrame:
 @st.cache_data(ttl=600, show_spinner=False)
 def load_arima_monthly(_client, grp: str) -> pd.DataFrame:
     return _q(_client, f"""
-        SELECT month, units_forecast, lo_80, hi_80
+        SELECT month, GREATEST(units_forecast, 0) AS units_forecast,
+               GREATEST(lo_80, 0) AS lo_80, GREATEST(hi_80, 0) AS hi_80
         FROM `{PROJECT}.forecast.group_forecast_long`
         WHERE group_key = @g ORDER BY month""",
               [bigquery.ScalarQueryParameter("g", "STRING", grp)])
@@ -499,6 +501,17 @@ def latest_reviews(rev: pd.DataFrame) -> pd.DataFrame:
     rev["color"] = rev["color"].fillna("")
     # последняя запись целиком (а не последнее непустое значение каждого поля)
     return rev.sort_values("ts").drop_duplicates(["country", "grp", "color"], keep="last")
+
+
+def _ints(df: pd.DataFrame, keep: tuple = ()) -> pd.DataFrame:
+    """Штуки — целыми числами (доли и проценты не трогаем)."""
+    df = df.copy()
+    for c in df.columns:
+        if c in keep or str(c).startswith("Рост"):
+            continue
+        if pd.api.types.is_float_dtype(df[c]):
+            df[c] = df[c].round(0).astype("Int64")
+    return df
 
 
 def _pct(v) -> str:
@@ -621,7 +634,7 @@ def render(client, author, log_event, tab_intro, num) -> None:
                     _pct(G["trend27"].sum() / T["F26"] - 1 if T["F26"] else np.nan) + " к '26",
                     help="Факт '26 × рост '26/'25 по каждой группе (рост ограничен −30%…+100%). "
                          "Нейтральная точка для разговора, не план.")
-    m[3].metric("Прогноз '27", num(T["P27"]), _pct(T["P27"] / T["F26"] - 1 if T["F26"] else np.nan) + " к '26")
+    m[3].metric("План Нины '27", num(T["P27"]), _pct(T["P27"] / T["F26"] - 1 if T["F26"] else np.nan) + " к '26")
     m[4].metric("С правками", num(T["Итог '27"]),
                 _pct(T["Итог '27"] / T["P27"] - 1 if T["P27"] else np.nan) + " к прогнозу")
 
@@ -663,8 +676,14 @@ def render(client, author, log_event, tab_intro, num) -> None:
         "Комментарий": view["Комментарий"],
     })
     show = pd.DataFrame(cols)
+    # штуки — целыми, как в таблице Нины
+    for c in show.columns:
+        if c in ("Нина к ARIMA", "Рост факт '26/'25", "Рост прогноз/факт '26", "Зима '26/'25", "💬"):
+            continue
+        if pd.api.types.is_float_dtype(show[c]):
+            show[c] = show[c].round(0).astype("Int64")
     pc = st.column_config.NumberColumn(format="percent")
-    nc = st.column_config.NumberColumn(format="localized")
+    nc = st.column_config.NumberColumn(format="localized", step=1)
     st.dataframe(
         show, hide_index=True, width="stretch", height=min(620, 38 + 35 * len(show)),
         column_config={
@@ -706,19 +725,19 @@ def render(client, author, log_event, tab_intro, num) -> None:
     left, right = st.columns([3, 2])
     with left:
         st.markdown("**По цветам**")
-        st.dataframe(pd.DataFrame({
+        st.dataframe(_ints(pd.DataFrame({
             "Цвет": C["color"], "Флаг": C["flag"], "Факт '25": C["F25"], "Факт '26": C["F26"],
             "Рост '26": C["yoy"], "Прогноз '27": C["P27"], "Рост '27": C["g27"],
-        }), hide_index=True, width="stretch",
+        })), hide_index=True, width="stretch",
             column_config={"Факт '25": nc, "Факт '26": nc, "Прогноз '27": nc,
                            "Рост '26": pc, "Рост '27": pc})
         with st.expander("По листингам (ASIN)"):
             A = summarize(gd if color is None else gd[gd["color"] == color], ["asin", "color", "old_asin"], has_nina)
             A = A.sort_values("P27", ascending=False)
-            st.dataframe(pd.DataFrame({
+            st.dataframe(_ints(pd.DataFrame({
                 "ASIN": A["asin"], "Старый ASIN": A["old_asin"], "Цвет": A["color"], "Флаг": A["flag"],
                 "Факт '25": A["F25"], "Факт '26": A["F26"], "Прогноз '27": A["P27"], "Рост '27": A["g27"],
-            }), hide_index=True, width="stretch",
+            })), hide_index=True, width="stretch",
                 column_config={"Факт '25": nc, "Факт '26": nc, "Прогноз '27": nc, "Рост '27": pc})
 
     with right:
