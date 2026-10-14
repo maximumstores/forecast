@@ -136,7 +136,7 @@ def map_columns(header: list) -> dict:
             if ym not in fact:
                 fact[ym] = i
             i += 1
-    out["fact"] = {k: v for k, v in fact.items() if k[0] in (2025, 2026)}
+    out["fact"] = {k: v for k, v in fact.items() if k[0] in (2024, 2025, 2026)}   # 2024 — для ARIMA
 
     # прогноз '27: «Нормированный план продаж…» и сразу за ним 2027-04 … 2028-03
     plan27: dict = {}
@@ -389,26 +389,40 @@ def load_planner(_client) -> pd.DataFrame:
         GROUP BY asin""")
 
 
+def _arima_src(country: str) -> tuple[str, str]:
+    """US — ARIMA планера по спросу с поправкой на OOS (group_forecast_long);
+    CA/DE/UK — ARIMA по продажам из таблиц Нины (group_forecast_intl). Оба считаются каждую ночь."""
+    if country == "US":
+        return f"`{PROJECT}.forecast.group_forecast_long`", "TRUE"
+    return f"`{PROJECT}.forecast.group_forecast_intl`", "country = @c"
+
+
+def load_arima(_client, country: str = "US") -> pd.DataFrame:
+    """ARIMA по группам на май–сентябрь '27 с 80% коридором."""
+    tbl, where = _arima_src(country)
+    return _load_arima(_client, tbl, where, country)
+
+
 @st.cache_data(ttl=600, show_spinner=False)
-def load_arima(_client) -> pd.DataFrame:
-    """ARIMA по группам (только US) на май–сентябрь '27 с 80% коридором.
-    Считается каждую ночь в sp_refresh_gold (forecast.group_forecast_long, горизонт 18 мес)."""
+def _load_arima(_client, tbl: str, where: str, country: str) -> pd.DataFrame:
     return _q(_client, f"""
         SELECT group_key AS grp, SUM(GREATEST(units_forecast, 0)) AS a27,
                SUM(GREATEST(lo_80, 0)) AS a_lo, SUM(GREATEST(hi_80, 0)) AS a_hi
-        FROM `{PROJECT}.forecast.group_forecast_long`
-        WHERE month BETWEEN '2027-05-01' AND '2027-09-01'
-        GROUP BY 1""")
+        FROM {tbl}
+        WHERE month BETWEEN '2027-05-01' AND '2027-09-01' AND {where}
+        GROUP BY 1""", [bigquery.ScalarQueryParameter("c", "STRING", country)])
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def load_arima_monthly(_client, grp: str) -> pd.DataFrame:
+def load_arima_monthly(_client, grp: str, country: str = "US") -> pd.DataFrame:
+    tbl, where = _arima_src(country)
     return _q(_client, f"""
         SELECT month, GREATEST(units_forecast, 0) AS units_forecast,
                GREATEST(lo_80, 0) AS lo_80, GREATEST(hi_80, 0) AS hi_80
-        FROM `{PROJECT}.forecast.group_forecast_long`
-        WHERE group_key = @g ORDER BY month""",
-              [bigquery.ScalarQueryParameter("g", "STRING", grp)])
+        FROM {tbl}
+        WHERE group_key = @g AND {where} ORDER BY month""",
+              [bigquery.ScalarQueryParameter("g", "STRING", grp),
+               bigquery.ScalarQueryParameter("c", "STRING", country)])
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -569,12 +583,10 @@ def render(client, author, log_event, tab_intro, num) -> None:
     sdf = season[season["country"] == country].copy()
     has_nina = (sdf[["n25", "n26", "n27"]].abs().sum() > 0).all()
     has_order = bool(sdf[["n_stock", "n_order"]].abs().sum().sum() > 0) if "n_order" in sdf else False
-    arima = pd.DataFrame()
-    if country == "US":
-        try:
-            arima = load_arima(client)
-        except Exception:  # noqa: BLE001
-            arima = pd.DataFrame()
+    try:
+        arima = load_arima(client, country)
+    except Exception:  # noqa: BLE001
+        arima = pd.DataFrame()
     has_arima = not arima.empty
 
     f1, f2, f3 = st.columns([2, 3, 1.3])
@@ -648,7 +660,8 @@ def render(client, author, log_event, tab_intro, num) -> None:
     st.caption(
         "Факт и прогноз — сумма за май–сентябрь. «Ориентир '27» = факт '26 × рост '26/'25 "
         "(рост ограничен −30%…+100%) — нейтральная точка для разговора, а не план. "
-        "«ARIMA '27» — статистический прогноз по истории продаж группы (только US), с 80% коридором; "
+        "«ARIMA '27» — статистический прогноз по истории продаж группы с 80% коридором "
+        "(US — по спросу с поправкой на OOS; CA/DE/UK — по продажам из таблиц Нины, без поправки на OOS); "
         "📈 — план Нины выше верхней границы коридора. "
         "«Зима '26/'25» — рост продаж за янв–мар: если он слабый, а прогноз лета сильный, это повод спросить почему."
     )
@@ -717,7 +730,7 @@ def render(client, author, log_event, tab_intro, num) -> None:
     ar_m = pd.DataFrame()
     if has_arima and color is None:
         try:
-            ar_m = load_arima_monthly(client, gsel)
+            ar_m = load_arima_monthly(client, gsel, country)
         except Exception:  # noqa: BLE001
             ar_m = pd.DataFrame()
     st.plotly_chart(monthly_chart(mon, gsel, color, ar_m), width="stretch", key=f"s27_chart_{country}")
