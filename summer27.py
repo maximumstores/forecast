@@ -476,6 +476,10 @@ def summarize(df: pd.DataFrame, by: list[str], use_nina: bool) -> pd.DataFrame:
         g["F25"], g["F26"], g["P27"] = g["f25"], g["f26"], g["p27"]
     g["yoy"] = np.where(g["F25"] > 0, g["F26"] / g["F25"] - 1, np.nan)
     g["g27"] = np.where(g["F26"] > 0, g["P27"] / g["F26"] - 1, np.nan)
+    # колонка Нины «OOS» = факт '26 без аутов (спрос, если бы товар был в наличии)
+    g["F26oos"] = np.where(g["n_oos"] > 0, g["n_oos"], g["F26"])
+    g["oos_pct"] = np.where(g["F26oos"] > 0, g["F26"] / g["F26oos"] - 1, np.nan)
+    g["g27oos"] = np.where(g["F26oos"] > 0, g["P27"] / g["F26oos"] - 1, np.nan)
     g["exec26"] = np.where(g["p26"] > 0, g["f26"] / g["p26"], np.nan)
     g["wyoy"] = np.where(g["w25"] > 0, g["w26"] / g["w25"] - 1, np.nan)
     trend = g["yoy"].clip(lower=-0.3, upper=1.0).fillna(0)
@@ -663,7 +667,9 @@ def render(client, author, log_event, tab_intro, num) -> None:
         "«ARIMA '27» — статистический прогноз по истории продаж группы с 80% коридором "
         "(US — по спросу с поправкой на OOS; CA/DE/UK — по продажам из таблиц Нины, без поправки на OOS); "
         "📈 — план Нины выше верхней границы коридора. "
-        "«Зима '26/'25» — рост продаж за янв–мар: если он слабый, а прогноз лета сильный, это повод спросить почему."
+        "«Зима '26/'25» — рост продаж за янв–мар: если он слабый, а прогноз лета сильный, это повод спросить почему. "
+        "«OOS %» и «Рост OOS/план» — как у Нины: «Факт '26 без аутов» — продажи, если бы товар был в наличии; "
+        "OOS % = факт / факт без аутов − 1; Рост OOS/план = прогноз '27 / факт без аутов − 1."
     )
     # порядок колонок — как в сводной «order» у Нины, плюс наши колонки для сверки
     cols = {"Группа": view["grp"], "Флаг": view["flag"],
@@ -672,15 +678,19 @@ def render(client, author, log_event, tab_intro, num) -> None:
         cols["ARIMA '27"] = view["a27"]
         cols["ARIMA 80%"] = [f"{num(lo)}–{num(hi)}" if pd.notna(lo) else "" for lo, hi in zip(view["a_lo"], view["a_hi"])]
         cols["Нина к ARIMA"] = np.where(view["a27"] > 0, view["P27"] / view["a27"] - 1, np.nan)
-    if has_order:
-        cols["Расч. остатки"] = view["n_stock"]
-        cols["Заказ"] = view["n_order"]
-        cols["OOS '25"] = view["n_oos"]
-        cols["Приход после заказа"] = view["n_inc"]
     cols.update({
         "Факт '25": view["F25"],
         "Рост факт '26/'25": view["yoy"],
         "Рост прогноз/факт '26": view["g27"],
+        "Рост OOS/план": view["g27oos"],
+        "OOS %": view["oos_pct"],
+        "Факт '26 без аутов": view["F26oos"],
+    })
+    if has_order:
+        cols["Расч. остатки"] = view["n_stock"]
+        cols["Заказ"] = view["n_order"]
+        cols["Приход после заказа"] = view["n_inc"]
+    cols.update({
         "Ориентир '27": view["trend27"],
         "Зима '26/'25": view["wyoy"],
         "Правка '27": view["Правка '27"],
@@ -691,7 +701,8 @@ def render(client, author, log_event, tab_intro, num) -> None:
     show = pd.DataFrame(cols)
     # штуки — целыми, как в таблице Нины
     for c in show.columns:
-        if c in ("Нина к ARIMA", "Рост факт '26/'25", "Рост прогноз/факт '26", "Зима '26/'25", "💬"):
+        if c in ("Нина к ARIMA", "Рост факт '26/'25", "Рост прогноз/факт '26", "Зима '26/'25", "💬",
+                 "Рост OOS/план", "OOS %"):
             continue
         if pd.api.types.is_float_dtype(show[c]):
             show[c] = show[c].round(0).astype("Int64")
@@ -701,10 +712,10 @@ def render(client, author, log_event, tab_intro, num) -> None:
         show, hide_index=True, width="stretch", height=min(620, 38 + 35 * len(show)),
         column_config={
             **{c: nc for c in ("Факт '25", "Факт '26", "Прогноз '27 (Нина)", "ARIMA '27",
-                               "Расч. остатки", "Заказ", "OOS '25",
+                               "Расч. остатки", "Заказ", "Факт '26 без аутов",
                                "Приход после заказа", "Ориентир '27", "Правка '27")},
             **{c: pc for c in ("Нина к ARIMA", "Рост факт '26/'25", "Рост прогноз/факт '26",
-                               "Зима '26/'25")},
+                               "Зима '26/'25", "Рост OOS/план", "OOS %")},
             "Комментарий": st.column_config.TextColumn(width="medium"),
         },
     )
@@ -741,9 +752,10 @@ def render(client, author, log_event, tab_intro, num) -> None:
         st.dataframe(_ints(pd.DataFrame({
             "Цвет": C["color"], "Флаг": C["flag"], "Факт '25": C["F25"], "Факт '26": C["F26"],
             "Рост '26": C["yoy"], "Прогноз '27": C["P27"], "Рост '27": C["g27"],
-        })), hide_index=True, width="stretch",
+            "Рост OOS/план": C["g27oos"], "OOS %": C["oos_pct"],
+        }), keep=("Рост OOS/план", "OOS %")), hide_index=True, width="stretch",
             column_config={"Факт '25": nc, "Факт '26": nc, "Прогноз '27": nc,
-                           "Рост '26": pc, "Рост '27": pc})
+                           "Рост '26": pc, "Рост '27": pc, "Рост OOS/план": pc, "OOS %": pc})
         with st.expander("По листингам (ASIN)"):
             A = summarize(gd if color is None else gd[gd["color"] == color], ["asin", "color", "old_asin"], has_nina)
             A = A.sort_values("P27", ascending=False)
