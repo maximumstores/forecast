@@ -365,6 +365,8 @@ def load_season(_client) -> pd.DataFrame:
           SUM(IF(kind='plan27' AND EXTRACT(YEAR FROM month)=2027 AND EXTRACT(MONTH FROM month) BETWEEN 5 AND 9, units, 0)) AS p27,
           SUM(IF(kind='fact'   AND EXTRACT(YEAR FROM month)=2025 AND EXTRACT(MONTH FROM month) BETWEEN 1 AND 3, units, 0)) AS w25,
           SUM(IF(kind='fact'   AND EXTRACT(YEAR FROM month)=2026 AND EXTRACT(MONTH FROM month) BETWEEN 1 AND 3, units, 0)) AS w26,
+          SUM(IF(kind='fact'   AND EXTRACT(YEAR FROM month)=2025 AND EXTRACT(MONTH FROM month) BETWEEN 1 AND 8, units, 0)) AS y25,
+          SUM(IF(kind='fact'   AND EXTRACT(YEAR FROM month)=2026 AND EXTRACT(MONTH FROM month) BETWEEN 1 AND 8, units, 0)) AS y26,
           SUM(IF(kind='nina_f25',  units, 0)) AS n25,
           SUM(IF(kind='nina_f26',  units, 0)) AS n26,
           SUM(IF(kind='nina_fc27', units, 0)) AS n27,
@@ -461,7 +463,7 @@ def save_review(client, country, grp, color, new_plan27, status, comment, author
 # ------------------------------------------------------------------ расчёты
 def summarize(df: pd.DataFrame, by: list[str], use_nina: bool) -> pd.DataFrame:
     cols = ["f25", "f26", "p26", "p27", "w25", "w26", "n25", "n26", "n27",
-            "n_stock", "n_order", "n_oos", "n_inc", "p27ma", "pl27ma"]
+            "n_stock", "n_order", "n_oos", "n_inc", "p27ma", "pl27ma", "y25", "y26"]
     df = df.copy()
     for c in cols:
         if c not in df:
@@ -480,11 +482,27 @@ def summarize(df: pd.DataFrame, by: list[str], use_nina: bool) -> pd.DataFrame:
     g["F26oos"] = np.where(g["n_oos"] > 0, g["n_oos"], g["F26"])
     g["oos_pct"] = np.where(g["F26oos"] > 0, g["F26"] / g["F26oos"] - 1, np.nan)
     g["g27oos"] = np.where(g["F26oos"] > 0, g["P27"] / g["F26oos"] - 1, np.nan)
+    # «Расчёт '27» — лучший метод на проверке летом '26 (ошибка −4% против −9% у ARIMA):
+    # спрос '26 без аутов × рост янв–авг '26 к янв–авг '25, рост ограничен −20%…+60%
+    g["ytd_g"] = np.where(g["y25"] > 0, g["y26"] / g["y25"], np.nan)
+    g["calc27"] = g["F26oos"] * np.clip(g["ytd_g"], 0.8, 1.6)
     g["exec26"] = np.where(g["p26"] > 0, g["f26"] / g["p26"], np.nan)
     g["wyoy"] = np.where(g["w25"] > 0, g["w26"] / g["w25"] - 1, np.nan)
     trend = g["yoy"].clip(lower=-0.3, upper=1.0).fillna(0)
     g["trend27"] = g["F26"] * (1 + trend)
     g["flag"] = [flag(r) for r in g.itertuples()]
+    return g
+
+
+def apply_ytd(g: pd.DataFrame, all_df: pd.DataFrame, key: str) -> pd.DataFrame:
+    """Рост янв–авг считаем по ВСЕМ ASIN группы/цвета (включая «Reorder = Нет»):
+    иначе продажи '25 на старых ASIN выпадают из базы и рост завышается (перелистинг)."""
+    y = all_df.groupby(key)[["y25", "y26"]].sum()
+    g = g.copy()
+    g["y25"] = g[key].map(y["y25"]).fillna(0)
+    g["y26"] = g[key].map(y["y26"]).fillna(0)
+    g["ytd_g"] = np.where(g["y25"] > 0, g["y26"] / g["y25"], np.nan)
+    g["calc27"] = g["F26oos"] * np.clip(g["ytd_g"], 0.8, 1.6)
     return g
 
 
@@ -601,6 +619,7 @@ def render(client, author, log_event, tab_intro, num) -> None:
     if grps_pick:
         sdf = sdf[sdf["grp"].isin(grps_pick)]
     only_flag = f3.toggle("Только с флагами", key="s27_onlyflag")
+    sdf_all = sdf.copy()   # все ASIN, без фильтра Reorder — для роста янв–авг
     if "reorder" in sdf and (sdf["reorder"].str.lower() == "да").any():
         only_reorder = st.toggle("Только «Reorder = Да» — как в сводной order у Нины", value=True,
                                  key="s27_reorder",
@@ -612,7 +631,7 @@ def render(client, author, log_event, tab_intro, num) -> None:
     last = latest_reviews(rev)
     last_c = last[last["country"] == country] if not last.empty else last
 
-    G = summarize(sdf, ["grp"], has_nina)
+    G = apply_ytd(summarize(sdf, ["grp"], has_nina), sdf_all, "grp")
     if not last_c.empty:
         grp_rev = last_c[last_c["color"] == ""].set_index("grp")
         G["Правка '27"] = G["grp"].map(grp_rev["new_plan27"])
@@ -644,7 +663,14 @@ def render(client, author, log_event, tab_intro, num) -> None:
 
     # ---------------- итоги страны
     T = G[["F25", "F26", "P27", "Итог '27"]].sum()
-    m = st.columns(5)
+    m = st.columns(6)
+    okc = G[G["calc27"].notna()]
+    c_sum, c_f, c_p = okc["calc27"].sum(), okc["F26"].sum(), okc["P27"].sum()
+    m[5].metric(f"Расчёт '27 · {len(okc)} групп", num(c_sum),
+                _pct(c_sum / c_f - 1 if c_f else np.nan) + " к '26",
+                help="Факт '26 без аутов × рост янв–авг '26 к янв–авг '25 (рост ограничен −20%…+60%). "
+                     "Этот метод точнее всех угадал лето '26 на проверке (ошибка −4%, ARIMA −9%). "
+                     f"План Нины по этим же группам: {num(c_p)} ({_pct(c_p / c_sum - 1 if c_sum else np.nan)} к расчёту).")
     m[0].metric(f"Факт '25, {SEASON_TXT}", num(T["F25"]))
     m[1].metric("Факт '26", num(T["F26"]), _pct(T["F26"] / T["F25"] - 1 if T["F25"] else np.nan) + " к '25")
     if has_arima:
@@ -681,12 +707,16 @@ def render(client, author, log_event, tab_intro, num) -> None:
         "⚠️ ARIMA ненадёжна — группа запущена в '26 или зимний товар (янв–мар продаёт больше, чем всё лето): "
         "там модель завышает лето, на неё не опираемся. "
         "«Зима '26/'25» — рост продаж за янв–мар: если он слабый, а прогноз лета сильный, это повод спросить почему. "
+        "«Расчёт '27» = факт '26 без аутов × рост янв–авг '26/'25 (рост в рамках −20%…+60%) — "
+        "метод, который точнее всех угадал лето '26 на проверке; «Нина к расчёту» — насколько план выше/ниже. "
         "«OOS %» и «Рост OOS/план» — как у Нины: «Факт '26 без аутов» — продажи, если бы товар был в наличии; "
         "OOS % = факт / факт без аутов − 1; Рост OOS/план = прогноз '27 / факт без аутов − 1."
     )
     # порядок колонок — как в сводной «order» у Нины, плюс наши колонки для сверки
     cols = {"Группа": view["grp"], "Флаг": view["flag"],
-            "Факт '26": view["F26"], "Прогноз '27 (Нина)": view["P27"]}
+            "Факт '26": view["F26"], "Прогноз '27 (Нина)": view["P27"],
+            "Расчёт '27": view["calc27"],
+            "Нина к расчёту": np.where(view["calc27"] > 0, view["P27"] / view["calc27"] - 1, np.nan)}
     if has_arima:
         cols["ARIMA '27"] = view["a27"]
         cols["ARIMA 80%"] = [f"{num(lo)}–{num(hi)}" if pd.notna(lo) else "" for lo, hi in zip(view["a_lo"], view["a_hi"])]
@@ -715,7 +745,7 @@ def render(client, author, log_event, tab_intro, num) -> None:
     # штуки — целыми, как в таблице Нины
     for c in show.columns:
         if c in ("Нина к ARIMA", "Рост факт '26/'25", "Рост прогноз/факт '26", "Зима '26/'25", "💬",
-                 "Рост OOS/план", "OOS %"):
+                 "Рост OOS/план", "OOS %", "Нина к расчёту"):
             continue
         if pd.api.types.is_float_dtype(show[c]):
             show[c] = show[c].round(0).astype("Int64")
@@ -724,10 +754,10 @@ def render(client, author, log_event, tab_intro, num) -> None:
     st.dataframe(
         show, hide_index=True, width="stretch", height=min(620, 38 + 35 * len(show)),
         column_config={
-            **{c: nc for c in ("Факт '25", "Факт '26", "Прогноз '27 (Нина)", "ARIMA '27",
+            **{c: nc for c in ("Факт '25", "Факт '26", "Прогноз '27 (Нина)", "ARIMA '27", "Расчёт '27",
                                "Расч. остатки", "Заказ", "Факт '26 без аутов",
                                "Приход после заказа", "Ориентир '27", "Правка '27")},
-            **{c: pc for c in ("Нина к ARIMA", "Рост факт '26/'25", "Рост прогноз/факт '26",
+            **{c: pc for c in ("Нина к ARIMA", "Нина к расчёту", "Рост факт '26/'25", "Рост прогноз/факт '26",
                                "Зима '26/'25", "Рост OOS/план", "OOS %")},
             "Комментарий": st.column_config.TextColumn(width="medium"),
         },
@@ -745,7 +775,8 @@ def render(client, author, log_event, tab_intro, num) -> None:
     gsel = st.selectbox("Группа", opts, key=f"s27_g_{country}",
                         format_func=lambda x: f"{x}  {G.set_index('grp').at[x, 'flag']}".strip())
     gd = sdf[sdf["grp"] == gsel]
-    C = summarize(gd, ["color"], has_nina).sort_values("P27", ascending=False)
+    C = apply_ytd(summarize(gd, ["color"], has_nina), sdf_all[sdf_all["grp"] == gsel], "color")
+    C = C.sort_values("P27", ascending=False)
     colors = ["вся группа"] + C["color"].tolist()
     csel = st.selectbox("Цвет", colors, key=f"s27_c_{country}_{gsel}")
     color = None if csel == "вся группа" else csel
@@ -765,9 +796,9 @@ def render(client, author, log_event, tab_intro, num) -> None:
         st.dataframe(_ints(pd.DataFrame({
             "Цвет": C["color"], "Флаг": C["flag"], "Факт '25": C["F25"], "Факт '26": C["F26"],
             "Рост '26": C["yoy"], "Прогноз '27": C["P27"], "Рост '27": C["g27"],
-            "Рост OOS/план": C["g27oos"], "OOS %": C["oos_pct"],
+            "Рост OOS/план": C["g27oos"], "OOS %": C["oos_pct"], "Расчёт '27": C["calc27"],
         }), keep=("Рост OOS/план", "OOS %")), hide_index=True, width="stretch",
-            column_config={"Факт '25": nc, "Факт '26": nc, "Прогноз '27": nc,
+            column_config={"Факт '25": nc, "Факт '26": nc, "Прогноз '27": nc, "Расчёт '27": nc,
                            "Рост '26": pc, "Рост '27": pc, "Рост OOS/план": pc, "OOS %": pc})
         with st.expander("По листингам (ASIN)"):
             A = summarize(gd if color is None else gd[gd["color"] == color], ["asin", "color", "old_asin"], has_nina)
