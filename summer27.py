@@ -631,7 +631,14 @@ def render(client, author, log_event, tab_intro, num) -> None:
         # группа без истории (новинка): ARIMA = 0, сравнивать не с чем
         no_hist = G["a_hi"].fillna(0) <= 0
         G.loc[no_hist, ["a27", "a_lo", "a_hi"]] = np.nan
-        above = G["a_hi"].notna() & (G["P27"] > G["a_hi"])
+        # ARIMA ненадёжна: группа запущена в '26 (нет лета '25) или зимний товар
+        # (янв–мар '26 продали больше, чем за всё лето '26) — модель переносит зимний
+        # уровень в лето. Проверено: все случаи «ARIMA > факт ×2» попадают сюда.
+        G["a_ok"] = G["a27"].notna() & (G["F25"] > 0) & (G["w26"] <= G["f26"])
+        bad = G["a27"].notna() & ~G["a_ok"]
+        G.loc[bad, "flag"] = G.loc[bad, "flag"].map(
+            lambda f: (f + " · " if f else "") + "⚠️ ARIMA ненадёжна")
+        above = G["a_ok"] & (G["P27"] > G["a_hi"])
         G.loc[above, "flag"] = G.loc[above, "flag"].map(
             lambda f: (f + " · " if f else "") + "📈 выше коридора ARIMA")
 
@@ -641,10 +648,14 @@ def render(client, author, log_event, tab_intro, num) -> None:
     m[0].metric(f"Факт '25, {SEASON_TXT}", num(T["F25"]))
     m[1].metric("Факт '26", num(T["F26"]), _pct(T["F26"] / T["F25"] - 1 if T["F25"] else np.nan) + " к '25")
     if has_arima:
-        a_sum = G["a27"].sum()
-        m[2].metric("ARIMA '27", num(a_sum), _pct(a_sum / T["F26"] - 1 if T["F26"] else np.nan) + " к '26",
-                    help="Статистический прогноз BigQuery ARIMA_PLUS по истории продаж каждой группы "
-                         "(спрос с поправкой на OOS), май–сентябрь '27.")
+        ok = G[G["a_ok"]]
+        a_sum, f_ok, p_ok = ok["a27"].sum(), ok["F26"].sum(), ok["P27"].sum()
+        m[2].metric(f"ARIMA '27 · {len(ok)} надёжных групп", num(a_sum),
+                    _pct(a_sum / f_ok - 1 if f_ok else np.nan) + " к '26",
+                    help="Статистический прогноз BigQuery ARIMA_PLUS, май–сентябрь '27 — только по группам, "
+                         "где модели можно верить (есть лето '25 и это не зимний товар). "
+                         f"План Нины по этим же группам: {num(p_ok)} "
+                         f"({_pct(p_ok / f_ok - 1 if f_ok else np.nan)} к факту '26).")
     else:
         m[2].metric("Ориентир '27 по тренду", num(G["trend27"].sum()),
                     _pct(G["trend27"].sum() / T["F26"] - 1 if T["F26"] else np.nan) + " к '26",
@@ -667,6 +678,8 @@ def render(client, author, log_event, tab_intro, num) -> None:
         "«ARIMA '27» — статистический прогноз по истории продаж группы с 80% коридором "
         "(US — по спросу с поправкой на OOS; CA/DE/UK — по продажам из таблиц Нины, без поправки на OOS); "
         "📈 — план Нины выше верхней границы коридора. "
+        "⚠️ ARIMA ненадёжна — группа запущена в '26 или зимний товар (янв–мар продаёт больше, чем всё лето): "
+        "там модель завышает лето, на неё не опираемся. "
         "«Зима '26/'25» — рост продаж за янв–мар: если он слабый, а прогноз лета сильный, это повод спросить почему. "
         "«OOS %» и «Рост OOS/план» — как у Нины: «Факт '26 без аутов» — продажи, если бы товар был в наличии; "
         "OOS % = факт / факт без аутов − 1; Рост OOS/план = прогноз '27 / факт без аутов − 1."
