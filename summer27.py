@@ -267,6 +267,99 @@ def fetch_country(sess, country: str, sheet_id: str) -> tuple[pd.DataFrame, dict
     return long, info
 
 
+PLAN_HIST = {"US": "1PIuxWENJHY6j6Xexzt5zU6W-4WnWHQwNBz4QJDlPpC8"}   # «Plan Sales 2025 US» — архив планов Нины
+PLAN_HIST_SHEET = "Plan Sales"
+PLAN_HIST_TBL = f"{PROJECT}.forecast.nina_plan_hist"
+
+
+def fetch_plan_hist(sess, country: str, sheet_id: str) -> pd.DataFrame:
+    """Архив планов Нины: сезонные «Plan/Fact/OOS season 24/25, 25/26» (сезон = апр–сен,
+    season 25/26 = 01.04.2025–30.09.2025) и помесячный план апр.2025–мар.2027 (колонки AT–BQ).
+    Заголовки — во 2-й строке, данные — с 3-й."""
+    base = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values"
+    rng = urllib.parse.quote(f"'{PLAN_HIST_SHEET}'!2:2", safe="")
+    r = sess.get(f"{base}/{rng}", params={"valueRenderOption": "FORMATTED_VALUE"}, timeout=60)
+    r.raise_for_status()
+    header = (r.json().get("values") or [[]])[0]
+    keys = [_key(x) for x in header]
+
+    def first(pred):
+        for i, k in enumerate(keys):
+            if pred(k):
+                return i
+        return None
+
+    wanted = {
+        "asin": first(lambda k: k == "asin"),
+        "grp": first(lambda k: k == "category+parent"),
+        "color": first(lambda k: k == "chinacolors"),
+        "reorder": first(lambda k: k.startswith("reorder")),
+    }
+    seasonal = {}
+    for i, k in enumerate(keys):
+        m = re.fullmatch(r"(plan|fact|oos)season(\d\d)/(\d\d)(.*)", k)
+        if m:
+            kind = f"{m.group(1)}{'_cov' if m.group(4) else ''}"
+            seasonal[f"s|{kind}|20{m.group(2)}"] = i
+    monthly = {}
+    for i in range(45, min(69, len(header))):          # AT … BQ
+        ym = _ru_month(header[i])
+        if ym:
+            monthly[f"m|plan|{ym[0]}-{ym[1]:02d}"] = i
+    if wanted["asin"] is None or not (seasonal or monthly):
+        raise RuntimeError(f"{country}: в «{PLAN_HIST_SHEET}» не нашёл ASIN или колонок плана")
+    cols = {**{k: v for k, v in wanted.items() if v is not None}, **seasonal, **monthly}
+    names = list(cols)
+    ranges = [f"'{PLAN_HIST_SHEET}'!{col_letter(cols[n])}3:{col_letter(cols[n])}" for n in names]
+    r = sess.get(f"{base}:batchGet",
+                 params=[("ranges", x) for x in ranges]
+                 + [("valueRenderOption", "UNFORMATTED_VALUE"), ("majorDimension", "COLUMNS")],
+                 timeout=180)
+    r.raise_for_status()
+    data = {n: (vr.get("values") or [[]])[0] for n, vr in zip(names, r.json().get("valueRanges", []))}
+    n_rows = max(len(v) for v in data.values())
+    raw = pd.DataFrame({n: list(v) + [None] * (n_rows - len(v)) for n, v in data.items()})
+    txt = lambda s: s.astype(str).str.strip().replace({"None": "", "nan": ""})  # noqa: E731
+    ident = pd.DataFrame({k: (txt(raw[k]) if k in raw else "") for k in ("asin", "grp", "color", "reorder")})
+    keep = ident["asin"].str.match(r"^B0[0-9A-Z]{8}$")
+    ident, raw = ident[keep], raw[keep]
+    rows = []
+    for n in names:
+        if "|" not in n:
+            continue
+        typ, kind, per = n.split("|")
+        vals = raw[n].map(_num).values
+        if typ == "s":   # сезон апр–сен года per
+            part = ident.assign(kind=f"season_{kind}", month=dt.date(int(per), 4, 1), units=vals)
+        else:
+            y, mth = per.split("-")
+            part = ident.assign(kind="month_plan", month=dt.date(int(y), int(mth), 1), units=vals)
+        rows.append(part[part["units"] != 0])
+    out = pd.concat(rows, ignore_index=True)
+    out.insert(0, "country", country)
+    return out
+
+
+def refresh_plan_hist(client: bigquery.Client, sess=None) -> dict:
+    sess = sess or _session()
+    frames, report = [], {}
+    for country, sid in PLAN_HIST.items():
+        try:
+            df = fetch_plan_hist(sess, country, sid)
+            frames.append(df)
+            report[country] = {"rows": int(len(df)), "kinds": sorted(df["kind"].unique().tolist())}
+        except Exception as exc:  # noqa: BLE001
+            report[country] = {"error": str(exc)[:300]}
+    if frames:
+        df = pd.concat(frames, ignore_index=True)
+        df["loaded_at"] = dt.datetime.now(dt.timezone.utc)
+        client.load_table_from_dataframe(
+            df, PLAN_HIST_TBL,
+            job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE"),
+        ).result()
+    return report
+
+
 def refresh_all(client: bigquery.Client) -> dict:
     sess = _session()
     frames, report = [], {}
@@ -316,6 +409,12 @@ def refresh_all(client: bigquery.Client) -> dict:
         job_config=bigquery.LoadJobConfig(
             write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE, schema=schema),
     ).result()
+    # архив планов Нины (для проверки точности прошлых планов); ошибка не валит основное обновление
+    try:
+        for c, v in refresh_plan_hist(client, sess).items():
+            report[f"архив планов {c}"] = v
+    except Exception as exc:  # noqa: BLE001
+        report["архив планов"] = {"error": str(exc)[:300]}
     return report
 
 
