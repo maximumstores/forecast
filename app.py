@@ -1069,7 +1069,7 @@ else:
 st.caption(f"Данные BigQuery · {scope}")
 
 is_admin = True              # вкладку «Использование» видят все сотрудники
-_sections = ["Что делать", "Данные", "Планирование", "Сверка", "Лето '27"]
+_sections = ["Что делать", "Данные", "Планирование", "Сверка", "Лето '27", "Точность плана"]
 if is_admin:
     _sections.append("Активность дашборда")
 # Разделы и подразделы. Каждое переключение пишется в журнал событий:
@@ -1095,8 +1095,8 @@ def _on_tab(key: str, section: str | None = None) -> None:
 
 
 _sec = st.tabs(_sections, key="nav_top", on_change=_on_tab, args=("nav_top",))
-sec_act, sec_data, sec_plan, sec_check, sec_summer = _sec[:5]
-sec_usage = _sec[5] if is_admin else None
+sec_act, sec_data, sec_plan, sec_check, sec_summer, sec_acc = _sec[:6]
+sec_usage = _sec[6] if is_admin else None
 
 
 def _subtabs(section: str):
@@ -2505,6 +2505,19 @@ if _open(sec_summer):
             summer27 = importlib.reload(summer27)
             summer27._loaded_mtime = _mtime
         summer27.render(client, author, log_event, tab_intro, num)
+
+
+# ------------------------------------------------------------------ точность плана
+if _open(sec_acc):
+    with sec_acc:
+        import importlib
+        import os
+        import accuracy
+        _mtime = os.path.getmtime(accuracy.__file__)
+        if getattr(accuracy, "_loaded_mtime", None) != _mtime:
+            accuracy = importlib.reload(accuracy)
+            accuracy._loaded_mtime = _mtime
+        accuracy.render(client, log_event, tab_intro, num)
 
 
 if sec_usage is not None and _open(sec_usage):

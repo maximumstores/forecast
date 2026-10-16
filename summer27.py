@@ -45,6 +45,10 @@ C25, C26, CP26, CP27, CTR = "#9AA8B5", "#2F6FB2", "#7FB0E0", "#C8752B", "#5E9C6A
 NINA_COLS = ("nina_f25", "nina_f26", "nina_fc27", "nina_stock", "nina_order", "nina_oos", "nina_inc")
 
 STATUSES = ["—", "согласовано", "под вопросом", "снизить", "повысить"]
+REASONS = ["—", "рост ниши / ключи", "новый цвет / запуск", "акция / промо / дил", "ауты прошлого года",
+           "рейтинг / отзывы", "цена / конкуренты", "реклама", "каннибализация (новые цвета съедают старые)",
+           "другое (в комментарии)"]
+REASON_LIMIT = 0.15   # правка дальше ±15% от «Расчёт '27» — только с причиной
 
 
 # ------------------------------------------------------------------ разбор заголовков
@@ -544,10 +548,10 @@ def load_reviews(_client) -> pd.DataFrame:
                        f"FROM `{REVIEW}` ORDER BY ts DESC")
 
 
-def save_review(client, country, grp, color, new_plan27, status, comment, author) -> None:
+def save_review(client, country, grp, color, new_plan27, status, comment, author, reason=None) -> None:
     client.query(
-        f"INSERT INTO `{REVIEW}` (country, grp, color, new_plan27, status, comment, author, ts) "
-        "VALUES (@c, @g, @col, @p, @s, @t, @a, CURRENT_TIMESTAMP())",
+        f"INSERT INTO `{REVIEW}` (country, grp, color, new_plan27, status, comment, author, reason, ts) "
+        "VALUES (@c, @g, @col, @p, @s, @t, @a, @r, CURRENT_TIMESTAMP())",
         job_config=bigquery.QueryJobConfig(query_parameters=[
             bigquery.ScalarQueryParameter("c", "STRING", country),
             bigquery.ScalarQueryParameter("g", "STRING", grp),
@@ -555,7 +559,8 @@ def save_review(client, country, grp, color, new_plan27, status, comment, author
             bigquery.ScalarQueryParameter("p", "FLOAT64", new_plan27),
             bigquery.ScalarQueryParameter("s", "STRING", None if status == "—" else status),
             bigquery.ScalarQueryParameter("t", "STRING", comment or None),
-            bigquery.ScalarQueryParameter("a", "STRING", author)]),
+            bigquery.ScalarQueryParameter("a", "STRING", author),
+            bigquery.ScalarQueryParameter("r", "STRING", None if not reason or reason == "—" else reason)]),
     ).result()
 
 
@@ -912,18 +917,25 @@ def render(client, author, log_event, tab_intro, num) -> None:
         cur = (G.set_index("grp").loc[gsel] if color is None else C.set_index("color").loc[color])
         st.markdown(f"**Правка и комментарий** — {gsel}" + (f" / {color}" if color else ""))
         with st.form(key=f"s27_form_{country}_{gsel}_{csel}", clear_on_submit=True):
+            calc_v = cur.get("calc27", np.nan)
             st.caption(f"Прогноз '27 сейчас: **{num(cur['P27'])}** · факт '26: {num(cur['F26'])} · "
-                       f"ориентир: {num(cur['trend27'])}")
+                       f"расчёт '27: {num(calc_v) if pd.notna(calc_v) else '—'}")
             new_val = st.number_input("Новый прогноз '27, шт (пусто — без правки)", min_value=0.0,
                                       value=None, step=10.0, format="%.0f")
             status = st.selectbox("Статус", STATUSES)
+            reason = st.selectbox("Причина отклонения от расчёта", REASONS,
+                                  help="Обязательна, если новый прогноз отличается от «Расчёт '27» больше чем на 15%. "
+                                       "По причинам после сезона посчитаем, какие правки улучшают прогноз.")
             text = st.text_area("Комментарий", placeholder="Почему так: промо, новый цвет, отзывы, OOS…")
             ok = st.form_submit_button("Сохранить", type="primary")
         if ok:
+            dev = (new_val / calc_v - 1) if (new_val is not None and pd.notna(calc_v) and calc_v > 0) else 0.0
             if new_val is None and status == "—" and not text.strip():
                 st.warning("Нечего сохранять — укажите правку, статус или комментарий.")
+            elif abs(dev) > REASON_LIMIT and reason == "—":
+                st.warning(f"Новый прогноз отличается от расчёта на {dev:+.0%} — выберите причину.")
             else:
-                save_review(client, country, gsel, color, new_val, status, text.strip(), author)
+                save_review(client, country, gsel, color, new_val, status, text.strip(), author, reason)
                 load_reviews.clear()
                 log_event("summer27", f"{country} {gsel}" + (f" / {color}" if color else ""))
                 st.success("Сохранено.")
