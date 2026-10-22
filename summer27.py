@@ -48,6 +48,11 @@ STATUSES = ["—", "согласовано", "под вопросом", "сни�
 REASONS = ["—", "рост ниши / ключи", "новый цвет / запуск", "акция / промо / дил", "ауты прошлого года",
            "рейтинг / отзывы", "цена / конкуренты", "реклама", "каннибализация (новые цвета съедают старые)",
            "другое (в комментарии)"]
+EVIDENCE = ["—",
+            "A — факт из наших данных (продажи, SQP, Business Reports)",
+            "B — проверено на истории '24–'26",
+            "C — аналог: похожий товар, конкурент, отраслевые данные",
+            "D — экспертная оценка без данных"]
 REASON_LIMIT = 0.15   # правка дальше ±15% от «Расчёт '27» — только с причиной
 
 
@@ -442,6 +447,9 @@ def ensure_tables(client: bigquery.Client) -> None:
           author STRING,
           ts TIMESTAMP NOT NULL
         )""").result()
+    # причина правки и уровень доказанности (A–D) — добавлены позже, у старой таблицы их может не быть
+    client.query(f"ALTER TABLE `{REVIEW}` ADD COLUMN IF NOT EXISTS reason STRING, "
+                 "ADD COLUMN IF NOT EXISTS evidence STRING").result()
     _ensured()["ok"] = True
 
 
@@ -548,10 +556,10 @@ def load_reviews(_client) -> pd.DataFrame:
                        f"FROM `{REVIEW}` ORDER BY ts DESC")
 
 
-def save_review(client, country, grp, color, new_plan27, status, comment, author, reason=None) -> None:
+def save_review(client, country, grp, color, new_plan27, status, comment, author, reason=None, evidence=None) -> None:
     client.query(
-        f"INSERT INTO `{REVIEW}` (country, grp, color, new_plan27, status, comment, author, reason, ts) "
-        "VALUES (@c, @g, @col, @p, @s, @t, @a, @r, CURRENT_TIMESTAMP())",
+        f"INSERT INTO `{REVIEW}` (country, grp, color, new_plan27, status, comment, author, reason, evidence, ts) "
+        "VALUES (@c, @g, @col, @p, @s, @t, @a, @r, @e, CURRENT_TIMESTAMP())",
         job_config=bigquery.QueryJobConfig(query_parameters=[
             bigquery.ScalarQueryParameter("c", "STRING", country),
             bigquery.ScalarQueryParameter("g", "STRING", grp),
@@ -560,7 +568,8 @@ def save_review(client, country, grp, color, new_plan27, status, comment, author
             bigquery.ScalarQueryParameter("s", "STRING", None if status == "—" else status),
             bigquery.ScalarQueryParameter("t", "STRING", comment or None),
             bigquery.ScalarQueryParameter("a", "STRING", author),
-            bigquery.ScalarQueryParameter("r", "STRING", None if not reason or reason == "—" else reason)]),
+            bigquery.ScalarQueryParameter("r", "STRING", None if not reason or reason == "—" else reason),
+            bigquery.ScalarQueryParameter("e", "STRING", None if not evidence or evidence == "—" else evidence[:1])]),
     ).result()
 
 
@@ -926,16 +935,19 @@ def render(client, author, log_event, tab_intro, num) -> None:
             reason = st.selectbox("Причина отклонения от расчёта", REASONS,
                                   help="Обязательна, если новый прогноз отличается от «Расчёт '27» больше чем на 15%. "
                                        "По причинам после сезона посчитаем, какие правки улучшают прогноз.")
+            evidence = st.selectbox("Чем подтверждено", EVIDENCE,
+                                    help="Уровень доказанности правки. Обязателен вместе с причиной. "
+                                         "D (без данных) — правку стоит закладывать только в высокий сценарий.")
             text = st.text_area("Комментарий", placeholder="Почему так: промо, новый цвет, отзывы, OOS…")
             ok = st.form_submit_button("Сохранить", type="primary")
         if ok:
             dev = (new_val / calc_v - 1) if (new_val is not None and pd.notna(calc_v) and calc_v > 0) else 0.0
             if new_val is None and status == "—" and not text.strip():
                 st.warning("Нечего сохранять — укажите правку, статус или комментарий.")
-            elif abs(dev) > REASON_LIMIT and reason == "—":
-                st.warning(f"Новый прогноз отличается от расчёта на {dev:+.0%} — выберите причину.")
+            elif abs(dev) > REASON_LIMIT and (reason == "—" or evidence == "—"):
+                st.warning(f"Новый прогноз отличается от расчёта на {dev:+.0%} — выберите причину и чем она подтверждена.")
             else:
-                save_review(client, country, gsel, color, new_val, status, text.strip(), author, reason)
+                save_review(client, country, gsel, color, new_val, status, text.strip(), author, reason, evidence)
                 load_reviews.clear()
                 log_event("summer27", f"{country} {gsel}" + (f" / {color}" if color else ""))
                 st.success("Сохранено.")

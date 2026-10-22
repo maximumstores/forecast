@@ -76,7 +76,7 @@ def load_season(_client, y: int, m_end: int) -> pd.DataFrame:
 @st.cache_data(ttl=300, show_spinner=False)
 def load_reasons(_client) -> pd.DataFrame:
     try:
-        return _q(_client, f"SELECT country, grp, color, new_plan27, reason, ts FROM {REVIEW} "
+        return _q(_client, f"SELECT country, grp, color, new_plan27, reason, evidence, ts FROM {REVIEW} "
                            "WHERE reason IS NOT NULL ORDER BY ts DESC")
     except Exception:  # noqa: BLE001
         return pd.DataFrame()
@@ -207,7 +207,8 @@ def render(client, log_event, tab_intro, num) -> None:
         st.info("Журнал причин правок начинается с лета '27: при правке во вкладке «Лето '27» "
                 "указывается причина. После сезона здесь появится, какие причины улучшали прогноз, а какие нет.")
     else:
-        st.dataframe(rs.groupby("reason").size().rename("Правок").reset_index()
-                     .rename(columns={"reason": "Причина"}), hide_index=True)
+        st.dataframe(rs.assign(evidence=rs["evidence"].fillna("—"))
+                     .groupby(["reason", "evidence"]).size().rename("Правок").reset_index()
+                     .rename(columns={"reason": "Причина", "evidence": "Уровень"}), hide_index=True)
         st.caption("Точность по причинам посчитаем, когда по летним правкам '27 придёт факт.")
     log_event("accuracy", f"{y} {basis}")
