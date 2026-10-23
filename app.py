@@ -1069,7 +1069,7 @@ else:
 st.caption(f"Данные BigQuery · {scope}")
 
 is_admin = True              # вкладку «Использование» видят все сотрудники
-_sections = ["Что делать", "Данные", "Планирование", "Сверка", "Лето '27", "Точность плана"]
+_sections = ["Что делать", "Данные", "Планирование", "Сверка", "Лето '27", "Точность плана", "Покрытие", "Версии плана"]
 if is_admin:
     _sections.append("Активность дашборда")
 # Разделы и подразделы. Каждое переключение пишется в журнал событий:
@@ -1095,8 +1095,8 @@ def _on_tab(key: str, section: str | None = None) -> None:
 
 
 _sec = st.tabs(_sections, key="nav_top", on_change=_on_tab, args=("nav_top",))
-sec_act, sec_data, sec_plan, sec_check, sec_summer, sec_acc = _sec[:6]
-sec_usage = _sec[6] if is_admin else None
+sec_act, sec_data, sec_plan, sec_check, sec_summer, sec_acc, sec_cover, sec_ver = _sec[:8]
+sec_usage = _sec[8] if is_admin else None
 
 
 def _subtabs(section: str):
@@ -2518,6 +2518,20 @@ if _open(sec_acc):
             accuracy = importlib.reload(accuracy)
             accuracy._loaded_mtime = _mtime
         accuracy.render(client, log_event, tab_intro, num)
+
+
+# ------------------------------------------------------------------ покрытие и старый сток
+if _open(sec_cover):
+    with sec_cover:
+        import stock_cover
+        stock_cover.render(client, log_event, tab_intro, num)
+
+
+# ------------------------------------------------------------------ версии плана
+if _open(sec_ver):
+    with sec_ver:
+        import plan_versions
+        plan_versions.render(client, author, log_event, tab_intro, num)
 
 
 if sec_usage is not None and _open(sec_usage):
