@@ -110,7 +110,7 @@ def load_stock(_client, snap: date) -> pd.DataFrame:
     st2 AS (
       SELECT asin, SUM(fulf) fulf, SUM(inbound) inbound, SUM(u30) u30,
              SUM(a271) a271, SUM(a365) a365, SUM(total) total
-      FROM st WHERE REGEXP_CONTAINS(asin, r'^B0[0-9A-Z]{8}$') GROUP BY asin),
+      FROM st WHERE REGEXP_CONTAINS(asin, r'^B0[0-9A-Z]{{8}}$') GROUP BY asin),
     g AS (SELECT asin, ANY_VALUE(grp) grp FROM {SRC} WHERE country='US' GROUP BY asin)
     SELECT st2.asin, g.grp, st2.fulf, st2.inbound, st2.u30, st2.a271, st2.a365, st2.total
     FROM st2 LEFT JOIN g USING (asin)"""
@@ -202,6 +202,10 @@ def render(client, log_event, tab_intro, num) -> None:
     with_inbound = c2.checkbox("Считать товар в пути (приёмка и отгружено)", value=False)
 
     stock = load_stock(client, snap)
+    if stock.empty:
+        st.warning(f"В снимке за {snap:%d.%m.%Y} не нашлось ни одного ASIN с остатком. "
+                   "Проверьте снимок в mt.stock_history (source = hopted_us_native) или выберите другую дату.")
+        return
     fc = load_forecast(client)
     table, check = build_table(stock, fc, snap, with_inbound)
     if table.empty:
