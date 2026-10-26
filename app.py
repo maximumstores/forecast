@@ -2523,14 +2523,27 @@ if _open(sec_acc):
 # ------------------------------------------------------------------ покрытие и старый сток
 if _open(sec_cover):
     with sec_cover:
+        import importlib
+        import os
         import stock_cover
+        # как у summer27/accuracy: Streamlit Cloud не перечитывает уже импортированный модуль
+        _mtime = os.path.getmtime(stock_cover.__file__)
+        if getattr(stock_cover, "_loaded_mtime", None) != _mtime:
+            stock_cover = importlib.reload(stock_cover)
+            stock_cover._loaded_mtime = _mtime
         stock_cover.render(client, log_event, tab_intro, num)
 
 
 # ------------------------------------------------------------------ версии плана
 if _open(sec_ver):
     with sec_ver:
+        import importlib
+        import os
         import plan_versions
+        _mtime = os.path.getmtime(plan_versions.__file__)
+        if getattr(plan_versions, "_loaded_mtime", None) != _mtime:
+            plan_versions = importlib.reload(plan_versions)
+            plan_versions._loaded_mtime = _mtime
         plan_versions.render(client, author, log_event, tab_intro, num)
 
 
