@@ -64,15 +64,26 @@ SOURCES = [
     # сток на руках и себестоимость — диапазон A:AM (39 колонок)
     ("mt.amazon_starting_balance_native", SHEET_ORDERS_STOCK,
                                       "Starting Amazon month Balance", "letter", '"',  True,  39),
-    # legacy-план, приходы и старый сток — диапазон A:JC (263 колонки)
-    ("mt.ishodnik_native",            SHEET_ISHODNIK,     "исходник",                     "letter", '"',   True,  263),
     # сырой сток прямо из файла Hopted (Manage FBA Inventory) — ближе всего
     # к Amazon, меняется каждый день. В расчёт пока не идёт, нужен для истории.
     ("mt.hopted_us_native",           SHEET_HOPTED,       "US V2",                        "auto",   '"',   True,  None),
     ("mt.hopted_ca_native",           SHEET_HOPTED,       "CA inv",                       "auto",   '"',   True,  None),
     ("mt.hopted_de_native",           SHEET_HOPTED,       "DE inv",                       "auto",   '"',   True,  None),
     ("mt.hopted_uk_native",           SHEET_HOPTED,       "UK inv",                       "auto",   '"',   True,  None),
+    # legacy-план, приходы и старый сток — диапазон A:JC (263 колонки)
+    ("mt.ishodnik_native",            SHEET_ISHODNIK,     "исходник",                     "letter", '"',   True,  263),
 ]
+
+# Источники, сбой которых не должен останавливать всё задание: остальные листы,
+# снимки стока и пересборка всё равно выполняются, задание в конце завершается
+# с ошибкой (Cloud Run показывает его как неудачное). Остальные источники критичны:
+# без продаж и стартового остатка пересборку не запускаем.
+# Hopted стоит раньше «исходника»: если «исходник» недоступен (доступ, переименование),
+# сток всё равно обновляется и снимки стока не пропадают.
+NON_CRITICAL = {
+    "mt.ishodnik_native",
+    "mt.hopted_us_native", "mt.hopted_ca_native", "mt.hopted_de_native", "mt.hopted_uk_native",
+}
 
 # Листы, срез которых сохраняется в mt.stock_history каждый день.
 # Строка хранится целиком как JSON — история не ломается, если в листе
@@ -274,7 +285,7 @@ def count(client: bigquery.Client, sql: str) -> int:
     return list(client.query(sql, location=LOCATION).result())[0][0]
 
 
-def save_history(client: bigquery.Client) -> None:
+def save_history(client: bigquery.Client, skip: set[str] | None = None) -> None:
     """Дописывает сегодняшний срез в mt.stock_history. Повторный запуск в тот
     же день заменяет срез, а не дублирует. Сравнивает со вчерашним: если
     сток не изменился ни в одной строке — это похоже на замороженный
@@ -294,6 +305,10 @@ def save_history(client: bigquery.Client) -> None:
     ).result()
 
     for table in HISTORY_SOURCES:
+        if skip and table in skip:
+            # источник не обновился сегодня — не записываем вчерашние данные под сегодняшней датой
+            log.warning("история %s: пропущена, источник не обновился в этом запуске", table)
+            continue
         src_name = table.split(".")[-1]
         client.query(
             f"""
@@ -348,52 +363,60 @@ def main() -> int:
     client = bigquery.Client(project=PROJECT, location=LOCATION)
     token = get_token()
     tmp = tempfile.mkdtemp()
+    failed: list[str] = []
 
     for i, (table, doc, sheet, mode, quote, nl, width) in enumerate(SOURCES):
-        gid = with_retries(lambda: resolve_gid(doc, sheet, token),
-                           f"поиск листа {table}")
-        path = os.path.join(tmp, f"{table.split('.')[-1]}.csv")
+        try:
+            gid = with_retries(lambda: resolve_gid(doc, sheet, token),
+                               f"поиск листа {table}")
+            path = os.path.join(tmp, f"{table.split('.')[-1]}.csv")
 
-        check = CONTENT_CHECKS.get(table)
-        for content_try in range(1, CONTENT_RETRIES + 1):
-            size = with_retries(
-                lambda: download_sheet(doc, gid, path, token),
-                f"выгрузка {table}")
-            log.info("%s: скачано %.1f МБ", table, size / 1024 / 1024)
+            check = CONTENT_CHECKS.get(table)
+            for content_try in range(1, CONTENT_RETRIES + 1):
+                size = with_retries(
+                    lambda: download_sheet(doc, gid, path, token),
+                    f"выгрузка {table}")
+                log.info("%s: скачано %.1f МБ", table, size / 1024 / 1024)
 
-            rows = with_retries(
-                lambda: load_csv(client, table, path, mode, quote, nl, width),
-                f"загрузка {table}")
-            log.info("%s: загружено строк — %d", table, rows)
+                rows = with_retries(
+                    lambda: load_csv(client, table, path, mode, quote, nl, width),
+                    f"загрузка {table}")
+                log.info("%s: загружено строк — %d", table, rows)
 
-            if not check:
-                break
-            sql, minimum, label, strict = check
-            got = count(client, sql.format(table=f"{PROJECT}.{table}"))
-            log.info("%s: %s — %d", table, label, got)
-            if got >= minimum:
-                break
-            if content_try < CONTENT_RETRIES:
-                log.warning("%s: %s %d меньше %d — формулы не досчитались, "
-                            "выгружу заново через %d с",
-                            table, label, got, minimum, CONTENT_WAIT)
-                time.sleep(CONTENT_WAIT)
-                token = get_token()
-            elif strict:
+                if not check:
+                    break
+                sql, minimum, label, strict = check
+                got = count(client, sql.format(table=f"{PROJECT}.{table}"))
+                log.info("%s: %s — %d", table, label, got)
+                if got >= minimum:
+                    break
+                if content_try < CONTENT_RETRIES:
+                    log.warning("%s: %s %d меньше %d — формулы не досчитались, "
+                                "выгружу заново через %d с",
+                                table, label, got, minimum, CONTENT_WAIT)
+                    time.sleep(CONTENT_WAIT)
+                    token = get_token()
+                elif strict:
+                    raise RuntimeError(
+                        f"{table}: {label} {got} после {CONTENT_RETRIES} попыток, "
+                        f"ожидалось не меньше {minimum} — источник пустой, "
+                        "пересборку не запускаю")
+                else:
+                    log.warning("%s: %s %d после %d попыток — колонка в источнике "
+                                "пустая. Это запасной источник, продолжаю без него.",
+                                table, label, got, CONTENT_RETRIES)
+
+            minimum = MIN_ROWS.get(table, 100)
+            if rows < minimum:
                 raise RuntimeError(
-                    f"{table}: {label} {got} после {CONTENT_RETRIES} попыток, "
-                    f"ожидалось не меньше {minimum} — источник пустой, "
-                    "пересборку не запускаю")
-            else:
-                log.warning("%s: %s %d после %d попыток — колонка в источнике "
-                            "пустая. Это запасной источник, продолжаю без него.",
-                            table, label, got, CONTENT_RETRIES)
+                    f"{table}: строк {rows}, ожидалось не меньше {minimum} — "
+                    "формат уехал, пересборку не запускаю")
 
-        minimum = MIN_ROWS.get(table, 100)
-        if rows < minimum:
-            raise RuntimeError(
-                f"{table}: строк {rows}, ожидалось не меньше {minimum} — "
-                "формат уехал, пересборку не запускаю")
+        except Exception as exc:  # noqa: BLE001
+            if table not in NON_CRITICAL:
+                raise
+            log.error("%s: источник не обновился, продолжаю без него: %s", table, exc)
+            failed.append(table)
 
         if i < len(SOURCES) - 1:
             log.info("пауза %d с перед следующим листом", PAUSE_BETWEEN)
@@ -402,7 +425,7 @@ def main() -> int:
     # ---------------------------------------------- история стока
     # не критично: если срез не сохранился, пересборку не останавливаем
     try:
-        save_history(client)
+        save_history(client, skip=set(failed))
     except Exception as exc:  # noqa: BLE001
         log.warning("срез истории не сохранился: %s", exc)
 
@@ -445,6 +468,9 @@ def main() -> int:
     ).result():
         log.info("%s: до %s, строк %d", row.kind, row.mx, row.n)
 
+    if failed:
+        log.error("Готово, но не обновились: %s. Данные из этих листов старые.", ", ".join(failed))
+        return 1
     log.info("Готово")
     return 0
 
