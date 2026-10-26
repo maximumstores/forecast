@@ -217,7 +217,10 @@ def render(client, log_event, tab_intro, num) -> None:
 
     c1, c2 = st.columns([1, 1])
     snap = c1.selectbox("Снимок стока", dates, format_func=lambda d: d.strftime("%d.%m.%Y"))
-    with_inbound = c2.checkbox("Считать товар в пути (приёмка и отгружено)", value=False)
+    with_inbound = c2.checkbox(
+        "Считать товар в пути (приёмка и отгружено)", value=True,
+        help="Учитывается товар, который уже на складах Amazon в приёмке или отгружен. "
+             "Заказы на фабрике и в море не учитываются: их нет в этих данных.")
 
     stock = load_stock(client, snap)
     if stock.empty:
