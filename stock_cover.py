@@ -77,6 +77,17 @@ def weeks_of_cover(stock: float, monthly: dict[date, float], today: date,
     return float(max_weeks)
 
 
+def demand_in_weeks(monthly: dict[date, float], today: date, weeks: int = 13) -> float:
+    """Сколько штук по прогнозу уйдёт за ближайшие weeks недель (равномерно внутри месяца)."""
+    total, day, end = 0.0, today, today + timedelta(weeks=weeks)
+    while day < end:
+        dim = calendar.monthrange(day.year, day.month)[1]
+        per_day = monthly.get(day.replace(day=1), 0.0) or 0.0
+        total += per_day / dim
+        day += timedelta(days=1)
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Загрузка
 # ---------------------------------------------------------------------------
@@ -151,11 +162,16 @@ def build_table(stock: pd.DataFrame, fc: pd.DataFrame, today: date,
         high = dict(zip(sub["month"], sub["high"]))
         have = r.fulf + (r.inbound if with_inbound else 0.0)
         old = r.a271 + r.a365
+        no_demand = bool(base) and demand_in_weeks(base, today) <= 0.5
         rows.append({
             "Группа": r.grp, "ASIN": r.asins, "Остаток, шт": r.fulf, "В пути, шт": r.inbound,
             "Отгрузка 30 дн.": r.u30,
-            "Нед. покрытия (прогноз)": weeks_of_cover(have, base, today) if base else np.nan,
-            "Нед. покрытия (верх коридора)": weeks_of_cover(have, high, today) if high else np.nan,
+            # без остатка и без спроса покрытие не определено; с остатком и без спроса — залежь (104+)
+            "Нед. покрытия (прогноз)": (np.nan if (no_demand and have <= 0) or not base
+                                        else weeks_of_cover(have, base, today)),
+            "Нед. покрытия (верх коридора)": (np.nan if (no_demand and have <= 0) or not high
+                                              else weeks_of_cover(have, high, today)),
+            "Нет спроса": no_demand,
             "Старше 271 дн., шт": old,
             "Доля старого": old / r.fulf if r.fulf else np.nan,
         })
@@ -164,6 +180,8 @@ def build_table(stock: pd.DataFrame, fc: pd.DataFrame, today: date,
     def flag(row) -> str:
         w, share = row["Нед. покрытия (верх коридора)"], row["Доля старого"]
         marks = []
+        if row["Нет спроса"] and row["Остаток, шт"] <= 0:
+            return "нет спроса"
         if pd.notna(w) and w < LOW_WEEKS:
             marks.append("🔴 мало")
         if pd.notna(row["Нед. покрытия (прогноз)"]) and row["Нед. покрытия (прогноз)"] > CEILING_WEEKS:
@@ -227,6 +245,7 @@ def render(client, log_event, tab_intro, num) -> None:
     k3.metric("Старше 271 дня, шт", num(old_total),
               f"{old_total / table['Остаток, шт'].sum():.1%} остатка")
 
+    table = table.drop(columns=["Нет спроса"])
     view = table.copy()
     for c in ("Остаток, шт", "В пути, шт", "Отгрузка 30 дн.", "Старше 271 дн., шт"):
         view[c] = view[c].map(num)
