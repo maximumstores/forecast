@@ -619,6 +619,22 @@ def apply_ytd(g: pd.DataFrame, all_df: pd.DataFrame, key: str) -> pd.DataFrame:
     return g
 
 
+# Ширина сценариев — из проверки на лете '26 (42 группы США, метод «Расчёта '27» на данных до мая '26):
+# за сезон в целом ошибка 5–8%, по группам в среднем 25% (WAPE). Поэтому коридор ±25% от базы.
+# Это один сезон и 42 группы: цифра ориентировочная, пересчитать после лета '27.
+SCEN_LOW = 0.75
+SCEN_HIGH = 1.25
+
+
+def add_scenarios(G: pd.DataFrame, has_arima: bool = False) -> pd.DataFrame:
+    """Низкий / высокий сценарий лета '27 вокруг «Расчёта '27» (база): база × 0.75 и × 1.25.
+    Это диапазон неопределённости, а не отдельные планы."""
+    G = G.copy()
+    G["low27"] = G["calc27"] * SCEN_LOW
+    G["high27"] = G["calc27"] * SCEN_HIGH
+    return G
+
+
 def flag(r) -> str:
     if r.F26 == 0 and r.P27 > 0:
         return "🆕 новинка"
@@ -774,6 +790,8 @@ def render(client, author, log_event, tab_intro, num) -> None:
         G.loc[above, "flag"] = G.loc[above, "flag"].map(
             lambda f: (f + " · " if f else "") + "📈 выше коридора ARIMA")
 
+    G = add_scenarios(G, has_arima)
+
     # ---------------- итоги страны
     T = G[["F25", "F26", "P27", "Итог '27"]].sum()
     m = st.columns(6)
@@ -804,6 +822,19 @@ def render(client, author, log_event, tab_intro, num) -> None:
     m[4].metric("С правками", num(T["Итог '27"]),
                 _pct(T["Итог '27"] / T["P27"] - 1 if T["P27"] else np.nan) + " к прогнозу")
 
+    sc = G[G["calc27"].notna()]
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Низкий сценарий '27", num(sc["low27"].sum()),
+              _pct(sc["low27"].sum() / sc["calc27"].sum() - 1 if sc["calc27"].sum() else np.nan) + " к базе",
+              help="База × 0.75. Ширина взята из проверки на лете '26: в среднем по группам ошибка 25%, "
+                   "по сезону в целом 5–8%. Если лето пойдёт слабее — ориентир для минимального заказа.")
+    s2.metric("База '27 (Расчёт)", num(sc["calc27"].sum()))
+    s3.metric("Высокий сценарий '27", num(sc["high27"].sum()),
+              _pct(sc["high27"].sum() / sc["calc27"].sum() - 1 if sc["calc27"].sum() else np.nan) + " к базе",
+              help="База × 1.25. Ширина взята из проверки на лете '26 (ошибка по группам в среднем 25%). "
+                   "Если лето пойдёт сильнее — сколько товара может не хватить. "
+                   "Это диапазон неопределённости, а не отдельный план.")
+
     view = G.copy()
     if only_flag:
         view = view[view["flag"] != ""]
@@ -829,7 +860,8 @@ def render(client, author, log_event, tab_intro, num) -> None:
     cols = {"Группа": view["grp"], "Флаг": view["flag"],
             "Факт '26": view["F26"], "Прогноз '27 (Нина)": view["P27"],
             "Расчёт '27": view["calc27"],
-            "Нина к расчёту": np.where(view["calc27"] > 0, view["P27"] / view["calc27"] - 1, np.nan)}
+            "Нина к расчёту": np.where(view["calc27"] > 0, view["P27"] / view["calc27"] - 1, np.nan),
+            "Низкий '27": view["low27"], "Высокий '27": view["high27"]}
     if has_arima:
         cols["ARIMA '27"] = view["a27"]
         cols["ARIMA 80%"] = [f"{num(lo)}–{num(hi)}" if pd.notna(lo) else "" for lo, hi in zip(view["a_lo"], view["a_hi"])]
