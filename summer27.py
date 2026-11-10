@@ -42,6 +42,7 @@ MONTH_SHORT = ["янв", "фев", "мар", "апр", "май", "июн", "ию
 
 C25, C26, CP26, CP27, CTR = "#9AA8B5", "#2F6FB2", "#7FB0E0", "#C8752B", "#5E9C6A"
 
+OOS_BELOW_LIMIT = 0.05   # доля ASIN, у которых OOS < факта, выше которой колонка OOS считается «не тем периодом»
 NINA_COLS = ("nina_f25", "nina_f26", "nina_fc27", "nina_stock", "nina_order", "nina_oos", "nina_inc")
 
 STATUSES = ["—", "согласовано", "под вопросом", "снизить", "повысить"]
@@ -252,9 +253,24 @@ def fetch_country(sess, country: str, sheet_id: str) -> tuple[pd.DataFrame, dict
     ident = ident[keep]
     raw = raw[keep]
 
+    # Колонка «OOS» у Нины суммирует месяцы между датами в служебных ячейках файла (CV3:CV4 в US).
+    # Если там не тот период (например январь–май вместо мая–сентября), «Факт без аутов» окажется
+    # за другие месяцы и завысит/занизит расчёт. Спрос без аутов не может быть меньше факта за тот же
+    # период, поэтому если у заметной доли ASIN OOS < факта '26 — колонку не берём (расчёт идёт по факту).
+    skip_oos = ""
+    if "nina_oos" in raw and "nina_f26" in raw:
+        oos_v, f26_v = raw["nina_oos"].map(_num), raw["nina_f26"].map(_num)
+        has = oos_v > 0
+        if has.sum() >= 20 and ((oos_v[has] < f26_v[has] - 0.5).mean() > OOS_BELOW_LIMIT):
+            skip_oos = (f"{country}: колонка «OOS» в таблице Нины не за период факта '26 "
+                        f"(у {(oos_v[has] < f26_v[has] - 0.5).mean():.0%} ASIN она меньше факта) — не используется. "
+                        "Попросите Нину поставить в служебные ячейки период май–сентябрь 2026.")
+
     rows = []
     for name in names:
         if name in ("asin", "old_asin", "grp", "category", "color", "reorder"):
+            continue
+        if name == "nina_oos" and skip_oos:
             continue
         vals = raw[name].map(_num)
         if "|" in name:
@@ -271,8 +287,10 @@ def fetch_country(sess, country: str, sheet_id: str) -> tuple[pd.DataFrame, dict
         "fact_months": len(cols["fact"]),
         "plan26_months": len(cols["plan26"]),
         "plan27_months": len(cols["plan27"]),
-        "nina_cols": [k for k in NINA_COLS if cols[k] is not None],
+        "nina_cols": [k for k in NINA_COLS if cols[k] is not None and not (k == "nina_oos" and skip_oos)],
     }
+    if skip_oos:
+        info["oos_skipped"] = skip_oos
     return long, info
 
 
@@ -712,6 +730,9 @@ def render(client, author, log_event, tab_intro, num) -> None:
                 load_season.clear()
                 load_monthly.clear()
                 season = load_season(client)
+                for v in report.values():
+                    if "oos_skipped" in v:
+                        st.warning(v["oos_skipped"])
                 errs = {c: v["error"] for c, v in report.items() if "error" in v}
                 if errs:
                     st.warning("Не прочитались: " + "; ".join(f"{c}: {e}" for c, e in errs.items()))
