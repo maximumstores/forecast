@@ -70,8 +70,15 @@ SOURCES = [
     ("mt.hopted_ca_native",           SHEET_HOPTED,       "CA inv",                       "auto",   '"',   True,  None),
     ("mt.hopted_de_native",           SHEET_HOPTED,       "DE inv",                       "auto",   '"',   True,  None),
     ("mt.hopted_uk_native",           SHEET_HOPTED,       "UK inv",                       "auto",   '"',   True,  None),
+    # открытые заказы (в пути и в производстве) по странам — вкладки order US/CA/DE/UK
+    # из Orders-Stock (ведёт Надежда). Сюда же попадают сток и приход по ASIN.
+    # Колонки по буквам: две шапки (названия и даты прихода партий), данные с 4-й строки.
+    ("mt.order_us_native",            SHEET_ORDERS_STOCK, "order US",                     "letter", '"',   True,  235),
+    ("mt.order_ca_native",            SHEET_ORDERS_STOCK, "order CA",                     "letter", '"',   True,  80),
+    ("mt.order_de_native",            SHEET_ORDERS_STOCK, "order DE",                     "letter", '"',   True,  91),
+    ("mt.order_uk_native",            SHEET_ORDERS_STOCK, "order UK",                     "letter", '"',   True,  71),
     # legacy-план, приходы и старый сток — диапазон A:JC (263 колонки)
-    ("mt.ishodnik_native",            SHEET_ISHODNIK,     "исходник",                     "letter", '"',   True,  263),
+    ("mt.ishodnik_native",           SHEET_ISHODNIK,     "исходник",                     "letter", '"',   True,  263),
 ]
 
 # Источники, сбой которых не должен останавливать всё задание: остальные листы,
@@ -83,6 +90,8 @@ SOURCES = [
 NON_CRITICAL = {
     "mt.ishodnik_native",
     "mt.hopted_us_native", "mt.hopted_ca_native", "mt.hopted_de_native", "mt.hopted_uk_native",
+    # заказы по странам нужны для проверки контракта, но план без них считается
+    "mt.order_us_native", "mt.order_ca_native", "mt.order_de_native", "mt.order_uk_native",
 }
 
 # Листы, срез которых сохраняется в mt.stock_history каждый день.
@@ -134,6 +143,10 @@ MIN_ROWS = {
     "mt.hopted_ca_native": 500,
     "mt.hopted_de_native": 500,
     "mt.hopted_uk_native": 500,
+    "mt.order_us_native": 5000,
+    "mt.order_ca_native": 5000,
+    "mt.order_de_native": 5000,
+    "mt.order_uk_native": 5000,
 }
 
 SCOPES = [
