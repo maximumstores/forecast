@@ -1069,7 +1069,7 @@ else:
 st.caption(f"Данные BigQuery · {scope}")
 
 is_admin = True              # вкладку «Использование» видят все сотрудники
-_sections = ["Что делать", "Данные", "Планирование", "Сверка", "Лето '27", "Проверка плана '27", "Точность плана", "Покрытие", "Версии плана"]
+_sections = ["Что делать", "Данные", "Планирование", "Сверка", "Лето '27", "Проверка плана '27", "Проверка заказа", "Точность плана", "Покрытие", "Версии плана"]
 if is_admin:
     _sections.append("Активность дашборда")
 # Разделы и подразделы. Каждое переключение пишется в журнал событий:
@@ -1095,8 +1095,8 @@ def _on_tab(key: str, section: str | None = None) -> None:
 
 
 _sec = st.tabs(_sections, key="nav_top", on_change=_on_tab, args=("nav_top",))
-sec_act, sec_data, sec_plan, sec_check, sec_summer, sec_pcheck, sec_acc, sec_cover, sec_ver = _sec[:9]
-sec_usage = _sec[9] if is_admin else None
+sec_act, sec_data, sec_plan, sec_check, sec_summer, sec_pcheck, sec_ocheck, sec_acc, sec_cover, sec_ver = _sec[:10]
+sec_usage = _sec[10] if is_admin else None
 
 
 def _subtabs(section: str):
@@ -2518,6 +2518,19 @@ if _open(sec_pcheck):
             plan_check = importlib.reload(plan_check)
             plan_check._loaded_mtime = _mtime
         plan_check.render(client, author, log_event, tab_intro, num)
+
+
+# ------------------------------------------------------------------ проверка заказа (контракт фабрики)
+if _open(sec_ocheck):
+    with sec_ocheck:
+        import importlib
+        import os
+        import order_check
+        _mtime = os.path.getmtime(order_check.__file__)
+        if getattr(order_check, "_loaded_mtime", None) != _mtime:
+            order_check = importlib.reload(order_check)
+            order_check._loaded_mtime = _mtime
+        order_check.render(client, author, log_event, tab_intro, num)
 
 
 # ------------------------------------------------------------------ точность плана
