@@ -23,6 +23,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from google.cloud import bigquery
+import google.auth
 from google.oauth2 import service_account
 
 PROJECT = "reorder-497714"
@@ -69,7 +70,9 @@ def get_client() -> bigquery.Client:
             st.secrets["gcp_service_account"], scopes=SCOPES
         )
         return bigquery.Client(credentials=creds, project=PROJECT, location="EU")
-    return bigquery.Client(project=PROJECT, location="EU")
+    # Cloud Run: учётка сервис-аккаунта, прикреплённого к сервису (без ключей).
+    creds, _ = google.auth.default(scopes=SCOPES)
+    return bigquery.Client(credentials=creds, project=PROJECT, location="EU")
 
 
 client = get_client()
