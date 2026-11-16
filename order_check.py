@@ -191,16 +191,62 @@ def country_split(group_qty: pd.DataFrame, orders: pd.DataFrame) -> pd.DataFrame
 
 
 # ------------------------------------------------------------------ данные
-def load_live(client) -> dict[tuple[str, str], float]:
-    """Сток+заказы сейчас (US) по группе×цвету; если таблицы нет — пусто."""
+_NUM = "IFNULL(SAFE_CAST(REGEXP_REPLACE({c}, r'[^0-9.\\-]', '') AS FLOAT64), 0)"
+
+
+def load_open(client) -> pd.DataFrame:
+    """Открытые заказы и сток «сейчас» из Orders-Stock (ночной job кладёт в mt.order_*_native).
+    Колонки: country, grp, color, open_orders (Order Total), stock_now (сток + inbound), spo (Order+Stock).
+    Если таблиц ещё нет — пустой датафрейм (вкладка работает по плану Нины)."""
+    def n(c):
+        return _NUM.format(c=c)
+    parts = [
+        f"SELECT 'US' AS country, col_A AS asin, {n('col_U')} AS oo, {n('col_N')} AS st, {n('col_M')} AS spo "
+        f"FROM `{s27.PROJECT}.mt.order_us_native`",
+    ]
+    for cc in ("CA", "DE", "UK"):
+        parts.append(
+            f"SELECT '{cc}', col_A, {n('col_R')}, {n('col_N')} + {n('col_Q')}, {n('col_M')} "
+            f"FROM `{s27.PROJECT}.mt.order_{cc.lower()}_native`")
+    sql = f"""
+        WITH o AS (SELECT * FROM ({' UNION ALL '.join(parts)}) WHERE REGEXP_CONTAINS(asin, r'^[A-Z0-9]{{10}}$')),
+        m AS (SELECT DISTINCT country, asin, grp, IFNULL(NULLIF(color,''),'—') AS color FROM `{s27.SRC}`)
+        SELECT o.country, m.grp, m.color, SUM(o.oo) AS open_orders, SUM(o.st) AS stock_now, SUM(o.spo) AS spo
+        FROM o JOIN m ON m.country = o.country AND m.asin = o.asin GROUP BY 1,2,3"""
     try:
-        df = s27._q(client, f"""
-            SELECT s.grp, IFNULL(NULLIF(s.color,''),'—') AS color, SUM(c.stock_plus_orders_us) AS spo
-            FROM (SELECT DISTINCT asin, grp, color FROM `{s27.SRC}` WHERE country='US') s
-            JOIN `{s27.PROJECT}.forecast.stock_current` c USING (asin) GROUP BY 1,2""")
+        return s27._q(client, sql)
     except Exception:  # noqa: BLE001
-        return {}
-    return {(r.grp, r.color): float(r.spo or 0) for r in df.itertuples()}
+        return pd.DataFrame(columns=["country", "grp", "color", "open_orders", "stock_now", "spo"])
+
+
+def country_table(contract_grp: pd.DataFrame, season: pd.DataFrame, openo: pd.DataFrame, grp: str) -> pd.DataFrame:
+    """Одна группа по странам: рекомендованная доля контракта против нужного заказа (план − сток) страны.
+    Доля — по заказу Нины (если у группы нет заказа нигде — делим по плану)."""
+    rows = []
+    for cc in sorted(season["country"].unique()):
+        sd = season[(season["country"] == cc) & (season["grp"] == grp)]
+        if "reorder" in sd and (sd["reorder"].str.lower() == "да").any():
+            sd = sd[sd["reorder"].str.lower() == "да"]
+        if sd.empty:
+            continue
+        plan = float(np.where(sd["n27"].sum() != 0, sd["n27"].sum(), sd["p27"].sum()))
+        od = openo[(openo["country"] == cc) & (openo["grp"] == grp)] if not openo.empty else openo
+        rows.append(dict(country=cc, plan=plan, stock=float(sd["n_stock"].sum()), nina_order=float(sd["n_order"].sum()),
+                         open_orders=float(od["open_orders"].sum()) if len(od) else np.nan,
+                         spo=float(od["spo"].sum()) if len(od) else np.nan))
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    C = float(contract_grp.loc[contract_grp["grp"] == grp, "qty"].sum())
+    base = df["nina_order"] if df["nina_order"].sum() > 0 else df["plan"]
+    df["share"] = base / base.sum() if base.sum() > 0 else np.nan
+    df["contract_est"] = (C * df["share"]).round()
+    df["diff"] = df["contract_est"] - df["nina_order"]
+    df["verdict"] = [
+        ("покрыто стоком+заказами (проверить)" if (pd.notna(r.spo) and r.plan > 0 and r.spo >= r.plan) else
+         verdict_color(r.contract_est, r.plan, r.nina_order, None))
+        for r in df.itertuples()]
+    return df
 
 
 # ------------------------------------------------------------------ интерфейс
@@ -268,23 +314,32 @@ def render(client, author, log_event, tab_intro, num) -> None:
     st.subheader("По цветам")
     pick_grp = st.selectbox("Группа", list(GT["grp"]), key="oc_grp")
     Gc = pc.build_table(sdf, sdf_all, has_nina, True)
-    live_all = load_live(client)
-    live = {c: v for (g, c), v in live_all.items() if g == pick_grp}
+    openo = load_open(client)
+    ous = openo[(openo["country"] == "US") & (openo["grp"] == pick_grp)] if not openo.empty else openo
+    live = {r.color: float(r.spo) for r in ous.itertuples()}
     CT = color_table(lines.dropna(subset=["grp"]), pick_grp, Gc, live)
     st.dataframe(CT.rename(columns=dict(color="Цвет", contract="Контракт", plan="План", stock="Сток 1 мая",
                                         nina_order="Заказ Нины", live="Сток+заказы сейчас", verdict="Вывод",
                                         diff="Контракт − заказ")), hide_index=True, use_container_width=True)
-    if not live_all:
-        st.caption("Сток+заказы сейчас недоступны (нет forecast.stock_current) — вывод только по плану Нины.")
+    if openo.empty:
+        st.caption("Открытых заказов из Orders-Stock пока нет (таблицы mt.order_* не загружены) — вывод только по плану Нины.")
 
-    st.subheader("Оценка по странам")
-    ords = season[season["reorder"].str.lower() == "да"].groupby(["country", "grp"], as_index=False)["n_order"].sum()
+    st.subheader("По странам (рекомендованная разбивка контракта)")
     gq = lines.dropna(subset=["grp"]).groupby("grp", as_index=False)["qty"].sum()
-    CS = country_split(gq, ords)
-    piv = CS.pivot_table(index="grp", columns="country", values="est", aggfunc="sum").round()
+    cg = st.selectbox("Группа", list(GT["grp"]), key="oc_cgrp")
+    CS = country_table(gq, season, openo, cg)
+    if CS.empty:
+        st.info("По этой группе нет данных в странах.")
+    else:
+        st.dataframe(CS.rename(columns=dict(
+            country="Страна", plan="План май–сен", stock="Сток на 1 мая", nina_order="Заказ Нины",
+            open_orders="Открытые заказы сейчас", spo="Сток+заказы сейчас", share="Доля",
+            contract_est="Контракт (оценка)", diff="Контракт − заказ Нины", verdict="Вывод")).drop(columns=[]),
+            hide_index=True, use_container_width=True)
+        st.caption("Контракт группы делится по доле заказа Нины в стране — это рекомендация, а не данные фабрики.")
+    piv = country_split(gq, season[season["reorder"].str.lower() == "да"].groupby(["country", "grp"], as_index=False)["n_order"].sum()) \
+        .pivot_table(index="grp", columns="country", values="est", aggfunc="sum").round()
     piv["Контракт"] = gq.set_index("grp")["qty"]
-    st.dataframe(piv.reset_index().rename(columns={"grp": "Группа"}), hide_index=True, use_container_width=True)
-    st.caption("Оценка: контракт группы × доля заказа Нины по стране. Реальную разбивку даёт только Нина/Сергей.")
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
