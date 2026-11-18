@@ -60,7 +60,6 @@ SOURCES = [
     ("mt.sales_us_fact_native",       SHEET_SALES,        "2127822292",                   "auto",   '"',   True, None),
     ("mt.sales_oos_amz_native",       SHEET_SALES,        "404969167",                    "auto",   "",    False, None),
     ("mt.sales_plus_oos_native",      SHEET_SALES,        "1547531617",                   "auto",   "",    False, None),
-    ("mt.SPR_native",                 SHEET_SPR,          "2096733449",                   "auto",   '"',   True,  None),
     # сток на руках и себестоимость — диапазон A:AM (39 колонок)
     ("mt.amazon_starting_balance_native", SHEET_ORDERS_STOCK,
                                       "Starting Amazon month Balance", "letter", '"',  True,  39),
@@ -79,19 +78,19 @@ SOURCES = [
     ("mt.order_uk_native",            SHEET_ORDERS_STOCK, "order UK",                     "letter", '"',   True,  71),
     # legacy-план, приходы и старый сток — диапазон A:JC (263 колонки)
     ("mt.ishodnik_native",           SHEET_ISHODNIK,     "исходник",                     "letter", '"',   True,  263),
+    # справочник стоит последним: его выгрузка чаще всего тормозит или падает,
+    # и это не должно задерживать сток, заказы и Hopted
+    ("mt.SPR_native",                 SHEET_SPR,          "2096733449",                   "auto",   '"',   True,  None),
 ]
 
-# Источники, сбой которых не должен останавливать всё задание: остальные листы,
-# снимки стока и пересборка всё равно выполняются, задание в конце завершается
-# с ошибкой (Cloud Run показывает его как неудачное). Остальные источники критичны:
-# без продаж и стартового остатка пересборку не запускаем.
-# Hopted стоит раньше «исходника»: если «исходник» недоступен (доступ, переименование),
-# сток всё равно обновляется и снимки стока не пропадают.
-NON_CRITICAL = {
-    "mt.ishodnik_native",
-    "mt.hopted_us_native", "mt.hopted_ca_native", "mt.hopted_de_native", "mt.hopted_uk_native",
-    # заказы по странам нужны для проверки контракта, но план без них считается
-    "mt.order_us_native", "mt.order_ca_native", "mt.order_de_native", "mt.order_uk_native",
+# Сбой одного листа не останавливает остальные: задание доходит до конца,
+# пишет в лог строку «ИСТОЧНИК УПАЛ», шлёт сообщение в Telegram и завершается
+# с ошибкой (Cloud Run показывает его как неудачное).
+# Пересборку forecast.* запускаем только если обновились эти источники:
+# без продаж, стартового остатка и справочника план посчитается на старых данных.
+GOLD_REQUIRES = {
+    "mt.sales_us_fact_native", "mt.sales_oos_amz_native", "mt.sales_plus_oos_native",
+    "mt.amazon_starting_balance_native", "mt.SPR_native",
 }
 
 # Листы, срез которых сохраняется в mt.stock_history каждый день.
@@ -371,12 +370,65 @@ def save_history(client: bigquery.Client, skip: set[str] | None = None) -> None:
                         "похоже, Hopted перестал обновлять лист", src_name)
 
 
+# ------------------------------------------------------------------ уведомления
+def one_line(exc: object, limit: int = 300) -> str:
+    """Причина сбоя одной строкой: тип и текст без переносов."""
+    text = " ".join(f"{type(exc).__name__}: {exc}".split())
+    return text[:limit]
+
+
+def notify(text: str) -> None:
+    """Сообщение в Telegram. Нужны переменные TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID
+    (в Cloud Run — из Secret Manager). Сбой отправки никогда не роняет задание."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        log.warning("Telegram не настроен (нет TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID), "
+                    "сообщение не отправлено: %s", text.replace("\n", " | "))
+        return
+    try:
+        resp = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                             json={"chat_id": chat, "text": text[:3500]}, timeout=30)
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Telegram: сообщение не отправилось: %s", type(exc).__name__)
+
+
+# Таблицы, по которым видно, что ночной запуск состоялся.
+FRESH_TABLES = ["mt.sales_us_fact_native", "mt.amazon_starting_balance_native",
+                "mt.order_us_native", "forecast.looker_fact_monthly"]
+FRESH_MAX_HOURS = 20
+
+
+def check_fresh() -> int:
+    """Запускается отдельно (python refresh.py --check-fresh), например через
+    Cloud Scheduler в 06:00 UTC: если ночной запуск не состоялся или не дошёл
+    до конца, таблицы будут старше FRESH_MAX_HOURS — шлём сообщение."""
+    import datetime as dt
+    client = bigquery.Client(project=PROJECT, location=LOCATION)
+    now = dt.datetime.now(dt.timezone.utc)
+    stale = []
+    for t in FRESH_TABLES:
+        mod = client.get_table(f"{PROJECT}.{t}").modified
+        age = (now - mod).total_seconds() / 3600
+        log.info("%s: обновлена %.1f ч назад", t, age)
+        if age > FRESH_MAX_HOURS:
+            stale.append(f"{t} — {age:.0f} ч назад")
+    if stale:
+        log.error("ЗАПУСК НЕ СОСТОЯЛСЯ ИЛИ НЕ ДОШЁЛ ДО КОНЦА | %s", "; ".join(stale))
+        notify("Ночное обновление forecast не состоялось или не дошло до конца.\n"
+               + "\n".join(f"- {x}" for x in stale))
+        return 1
+    return 0
+
+
 # ------------------------------------------------------------------ main
 def main() -> int:
     client = bigquery.Client(project=PROJECT, location=LOCATION)
     token = get_token()
     tmp = tempfile.mkdtemp()
     failed: list[str] = []
+    errors: dict[str, str] = {}
 
     for i, (table, doc, sheet, mode, quote, nl, width) in enumerate(SOURCES):
         try:
@@ -426,10 +478,9 @@ def main() -> int:
                     "формат уехал, пересборку не запускаю")
 
         except Exception as exc:  # noqa: BLE001
-            if table not in NON_CRITICAL:
-                raise
-            log.error("%s: источник не обновился, продолжаю без него: %s", table, exc)
+            log.error("ИСТОЧНИК УПАЛ | %s | %s", table, one_line(exc))
             failed.append(table)
+            errors[table] = one_line(exc)
 
         if i < len(SOURCES) - 1:
             log.info("пауза %d с перед следующим листом", PAUSE_BETWEEN)
@@ -441,6 +492,15 @@ def main() -> int:
         save_history(client, skip=set(failed))
     except Exception as exc:  # noqa: BLE001
         log.warning("срез истории не сохранился: %s", exc)
+
+    # ---------------------------------------------- пересобирать ли forecast.*
+    blocked = sorted(set(failed) & GOLD_REQUIRES)
+    if blocked:
+        log.error("ПЕРЕСБОРКА ПРОПУЩЕНА | не обновились: %s. forecast.* остаётся от прошлого запуска.",
+                  ", ".join(blocked))
+        notify("Ночное обновление forecast: пересборка пропущена.\n"
+               + "\n".join(f"- {t}: {errors.get(t, '?')}" for t in failed))
+        return 1
 
     # ---------------------------------------------- проверки silver-слоя
     checks = [
@@ -483,14 +543,19 @@ def main() -> int:
 
     if failed:
         log.error("Готово, но не обновились: %s. Данные из этих листов старые.", ", ".join(failed))
+        notify("Ночное обновление forecast завершено с ошибкой.\n"
+               + "\n".join(f"- {t}: {errors.get(t, '?')}" for t in failed))
         return 1
     log.info("Готово")
     return 0
 
 
 if __name__ == "__main__":
+    if "--check-fresh" in sys.argv:
+        sys.exit(check_fresh())
     try:
         sys.exit(main())
     except Exception as exc:  # noqa: BLE001
-        log.error("Обновление не прошло: %s", exc)
+        log.error("Обновление не прошло: %s", one_line(exc))
+        notify(f"Ночное обновление forecast упало: {one_line(exc)}")
         sys.exit(1) 
