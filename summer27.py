@@ -87,6 +87,45 @@ def _iso_or_serial(h) -> dt.date | None:
     return None
 
 
+def _plan_month(h) -> dt.date | None:
+    """Месяц из заголовка плана: 2027-04-01, 01.04.2026 или серийное число Excel.
+    Только внутри блока, найденного по подписи (см. find_plan_blocks): сами по себе
+    даты вида 01.04.2026 встречаются и в блоках приходов."""
+    s = _norm(h)
+    m = re.fullmatch(r"01\.(\d{2})\.(\d{4})", s)
+    if m and 1 <= int(m.group(1)) <= 12:
+        return dt.date(int(m.group(2)), int(m.group(1)), 1)
+    return _iso_or_serial(h)
+
+
+PLAN_TITLE = "нормированныйпланпродаж"
+
+
+def find_plan_blocks(h: list, keys: list) -> dict:
+    """{год начала сезона: {(год, месяц): индекс колонки}} для каждого блока
+    «Нормированный план продаж …» (12 месяцев подряд справа от подписи).
+    Сезон блока — год его первого месяца (апрель 2026 → 2026, апрель 2027 → 2027)."""
+    out: dict = {}
+    for i, k in enumerate(keys):
+        if not k.startswith(PLAN_TITLE):
+            continue
+        months: dict = {}
+        j = i + 1
+        while j < len(h) and len(months) < 12:
+            d = _plan_month(h[j])
+            if d is None:
+                break
+            months[(d.year, d.month)] = j
+            j += 1
+        if len(months) < 12:
+            continue
+        first = min(months)
+        if first[1] != 4:        # сезон начинается с апреля
+            continue
+        out.setdefault(first[0], months)
+    return out
+
+
 def _ru_month(h) -> tuple[int, int] | None:
     """(год, месяц) из заголовка вида «янв.2025», «мая2026», «сент.2025»."""
     m = re.fullmatch(r"([а-я]+)\.?\s?(\d{4})", _norm(h).lower())
@@ -148,34 +187,15 @@ def map_columns(header: list) -> dict:
             i += 1
     out["fact"] = {k: v for k, v in fact.items() if k[0] in (2024, 2025, 2026)}   # 2024 — для ARIMA
 
-    # прогноз '27: «Нормированный план продаж…» и сразу за ним 2027-04 … 2028-03
-    plan27: dict = {}
-    p27 = None
-    for i in range(1, len(h)):
-        if _iso_or_serial(h[i]) == dt.date(2027, 4, 1) and keys[i - 1].startswith("нормированныйпланпродаж"):
-            p27 = i
-            break
-    if p27 is not None:
-        for k in range(12):
-            d = _iso_or_serial(h[p27 + k]) if p27 + k < len(h) else None
-            if d is not None:
-                plan27[(d.year, d.month)] = p27 + k
-    out["plan27"] = plan27
-
-    # план '26: блок 2026-04 … 2027-03 после блока '27
-    plan26: dict = {}
-    from_i = (p27 + 12) if p27 is not None else 0
-    p26 = None
-    for i in range(from_i, len(h) - 1):
-        if _iso_or_serial(h[i]) == dt.date(2026, 4, 1) and _iso_or_serial(h[i + 1]) == dt.date(2026, 5, 1):
-            p26 = i
-            break
-    if p26 is not None:
-        for k in range(12):
-            d = _iso_or_serial(h[p26 + k]) if p26 + k < len(h) else None
-            if d is not None:
-                plan26[(d.year, d.month)] = p26 + k
-    out["plan26"] = plan26
+    # Планы по подписи заголовка: «Нормированный план продаж 26-27» / «27-28» и сразу за ним
+    # 12 месяцев. Даты в блоках бывают в разных форматах (2027-04-01, 01.04.2026, серийное
+    # число), поэтому блок ищем по подписи, а сезон определяем по первому месяцу.
+    # В CA и UK подпись «26-27» набрана как «26-25», а у «27-28» года нет вовсе, так что
+    # по цифрам в подписи сезон не определить.
+    blocks = find_plan_blocks(h, keys)
+    out["plan27"] = blocks.get(2027, {})
+    out["plan26"] = blocks.get(2026, {})
+    out["plan_blocks"] = {y: col_letter(min(m.values()) - 1) for y, m in blocks.items()}   # колонка с подписью
     return out
 
 
@@ -286,6 +306,7 @@ def fetch_country(sess, country: str, sheet_id: str) -> tuple[pd.DataFrame, dict
         "rows": int(len(ident)),
         "fact_months": len(cols["fact"]),
         "plan26_months": len(cols["plan26"]),
+        "plan_blocks": cols.get("plan_blocks", {}),
         "plan27_months": len(cols["plan27"]),
         "nina_cols": [k for k in NINA_COLS if cols[k] is not None and not (k == "nina_oos" and skip_oos)],
     }
