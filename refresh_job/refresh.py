@@ -130,6 +130,31 @@ CONTENT_CHECKS = {
 CONTENT_RETRIES = 3
 CONTENT_WAIT = 240      # секунд между повторными выгрузками
 
+# Заголовки ключевых колонок: в загруженном листе должна быть строка, где все
+# перечисленные колонки равны указанному тексту. Если лист переставили или
+# переименовали колонки, таблица в BigQuery не перезаписывается.
+# Для трёх листов продаж проверка заголовков невозможна: в них нет строки с ASIN
+# (заголовки #REF!), для них работают число строк и защита от резкого сжатия.
+HEADER_CHECKS = {
+    "mt.SPR_native": [("string_field_0", "ASIN"), ("string_field_1", "Old ASIN")],
+    "mt.amazon_starting_balance_native": [("col_A", "ASIN"), ("col_B", "Old ASIN"),
+                                          ("col_D", "Category+parent"), ("col_F", "Stock US")],
+    "mt.hopted_us_native": [("string_field_1", "ASIN"), ("string_field_7", "FBA fulfillable quantity")],
+    "mt.hopted_ca_native": [("string_field_5", "ASIN"), ("string_field_6", "FBA total quantity")],
+    "mt.hopted_de_native": [("string_field_6", "ASIN"), ("string_field_7", "FBA total quantity")],
+    "mt.hopted_uk_native": [("string_field_6", "ASIN"), ("string_field_7", "FBA total quantity")],
+    "mt.order_us_native": [("col_A", "ASIN"), ("col_B", "Old ASIN"), ("col_E", "Category+parent")],
+    "mt.order_ca_native": [("col_A", "ASIN"), ("col_B", "Old ASIN")],
+    "mt.order_de_native": [("col_A", "ASIN"), ("col_B", "Old ASIN")],
+    "mt.order_uk_native": [("col_A", "ASIN"), ("col_B", "Old ASIN")],
+    "mt.ishodnik_native": [("col_A", "ASIN"), ("col_B", "Old ASIN"), ("col_C", "Category+parent")],
+}
+
+# Новая выгрузка не может быть короче прежней таблицы больше чем на эту долю:
+# так отсекается лист, который отдали обрезанным, но с числом строк выше порога.
+SHRINK_LIMIT = 0.30
+STAGE_PREFIX = "_stage_"
+
 # ожидаемое число строк — если после загрузки сильно меньше, значит формат уехал
 MIN_ROWS = {
     "mt.sales_us_fact_native": 5000,
@@ -243,6 +268,86 @@ def reshape_to_letters(path: str, width: int) -> str:
     with open(out, "w", encoding="utf-8", newline="") as fh:
         fh.write(buf.getvalue())
     return out
+
+
+def stage_name(table: str) -> str:
+    """mt.order_us_native -> mt._stage_order_us_native: сюда грузим и проверяем,
+    в рабочую таблицу копируем только после проверок."""
+    dataset, name = table.split(".", 1)
+    return f"{dataset}.{STAGE_PREFIX}{name}"
+
+
+def check_csv_complete(path: str, quote_char: str = '"') -> int:
+    """Файл не пустой и не оборван: строгий разбор CSV (незакрытая кавычка в конце
+    файла — ошибка), последняя строка не короче половины типичной ширины."""
+    from collections import Counter
+    widths: Counter = Counter()
+    last = None
+    n = 0
+    kwargs = {"quoting": csv.QUOTE_NONE} if quote_char == "" else {}
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            for row in csv.reader(fh, strict=True, **kwargs):
+                n += 1
+                widths[len(row)] += 1
+                last = row
+    except csv.Error as exc:
+        raise RuntimeError(f"выгрузка оборвана или повреждена: {exc}") from exc
+    if n == 0:
+        raise RuntimeError("пустая выгрузка: в файле нет ни одной строки")
+    modal = widths.most_common(1)[0][0]
+    if len(last) < modal / 2:
+        raise RuntimeError(f"выгрузка оборвана: последняя строка {len(last)} колонок из {modal}")
+    return n
+
+
+def check_header(client: bigquery.Client, table: str, stage: str) -> None:
+    """В загруженной таблице есть строка заголовков с ожидаемыми ключевыми колонками."""
+    pairs = HEADER_CHECKS.get(table)
+    if not pairs:
+        return
+    cond = " AND ".join(f"CAST({c} AS STRING) = '{v}'" for c, v in pairs)
+    found = count(client, f"SELECT COUNT(*) FROM `{PROJECT}.{stage}` WHERE {cond}")
+    if found == 0:
+        raise RuntimeError("заголовки ключевых колонок не совпали: "
+                           + ", ".join(f"{c}={v!r}" for c, v in pairs)
+                           + " — лист изменили, рабочая таблица не тронута")
+
+
+def previous_rows(client: bigquery.Client, table: str) -> int | None:
+    try:
+        return client.get_table(f"{PROJECT}.{table}").num_rows
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def validate_staged(client: bigquery.Client, table: str, stage: str, rows: int) -> None:
+    """Проверки загруженного в стадию: число строк, сжатие против прежней таблицы,
+    заголовки. Любая ошибка — рабочая таблица остаётся как была."""
+    minimum = MIN_ROWS.get(table, 100)
+    if rows < minimum:
+        raise RuntimeError(f"строк {rows}, ожидалось не меньше {minimum} — "
+                           "формат уехал или лист пришёл неполным")
+    prev = previous_rows(client, table)
+    if prev and rows < prev * (1 - SHRINK_LIMIT):
+        raise RuntimeError(f"строк {rows} против {prev} в рабочей таблице: "
+                           f"сжатие больше {SHRINK_LIMIT:.0%}, похоже на обрезанный лист")
+    check_header(client, table, stage)
+
+
+def promote(client: bigquery.Client, stage: str, table: str) -> None:
+    """Атомарно заменяет рабочую таблицу проверенной стадией и удаляет стадию."""
+    cfg = bigquery.CopyJobConfig(write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE)
+    client.copy_table(f"{PROJECT}.{stage}", f"{PROJECT}.{table}",
+                      job_config=cfg, location=LOCATION).result()
+    drop_stage(client, stage)
+
+
+def drop_stage(client: bigquery.Client, stage: str) -> None:
+    try:
+        client.delete_table(f"{PROJECT}.{stage}", not_found_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("стадию %s удалить не удалось: %s", stage, one_line(exc))
 
 
 def load_csv(client: bigquery.Client, table: str, path: str, mode: str,
@@ -394,26 +499,29 @@ def notify(text: str) -> None:
         log.warning("Telegram: сообщение не отправилось: %s", type(exc).__name__)
 
 
-# Таблицы, по которым видно, что ночной запуск состоялся.
+# Таблицы, по которым видно, что ночной запуск состоялся и дошёл до конца.
 FRESH_TABLES = ["mt.sales_us_fact_native", "mt.amazon_starting_balance_native",
                 "mt.order_us_native", "forecast.looker_fact_monthly"]
-FRESH_MAX_HOURS = 20
+FRESH_SINCE_UTC = os.environ.get("FRESH_SINCE_UTC", "03:00")   # время старта ночного запуска
 
 
 def check_fresh() -> int:
-    """Запускается отдельно (python refresh.py --check-fresh), например через
-    Cloud Scheduler в 06:00 UTC: если ночной запуск не состоялся или не дошёл
-    до конца, таблицы будут старше FRESH_MAX_HOURS — шлём сообщение."""
+    """Запускается отдельно (python refresh.py --check-fresh), например в 04:30 UTC:
+    каждая из FRESH_TABLES должна быть обновлена не раньше сегодняшнего FRESH_SINCE_UTC.
+    Иначе запуск не состоялся или не дошёл до конца — сообщение в Telegram."""
     import datetime as dt
     client = bigquery.Client(project=PROJECT, location=LOCATION)
     now = dt.datetime.now(dt.timezone.utc)
+    hh, mm = (int(x) for x in FRESH_SINCE_UTC.split(":"))
+    since = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if since > now:                 # проверка раньше времени старта — смотрим на вчерашний
+        since -= dt.timedelta(days=1)
     stale = []
     for t in FRESH_TABLES:
         mod = client.get_table(f"{PROJECT}.{t}").modified
-        age = (now - mod).total_seconds() / 3600
-        log.info("%s: обновлена %.1f ч назад", t, age)
-        if age > FRESH_MAX_HOURS:
-            stale.append(f"{t} — {age:.0f} ч назад")
+        log.info("%s: обновлена %s", t, mod.strftime("%Y-%m-%d %H:%M UTC"))
+        if mod < since:
+            stale.append(f"{t} — обновлена {mod.strftime('%d.%m %H:%M')} UTC")
     if stale:
         log.error("ЗАПУСК НЕ СОСТОЯЛСЯ ИЛИ НЕ ДОШЁЛ ДО КОНЦА | %s", "; ".join(stale))
         notify("Ночное обновление forecast не состоялось или не дошло до конца.\n"
@@ -437,21 +545,24 @@ def main() -> int:
             path = os.path.join(tmp, f"{table.split('.')[-1]}.csv")
 
             check = CONTENT_CHECKS.get(table)
+            stage = stage_name(table)
             for content_try in range(1, CONTENT_RETRIES + 1):
                 size = with_retries(
                     lambda: download_sheet(doc, gid, path, token),
                     f"выгрузка {table}")
                 log.info("%s: скачано %.1f МБ", table, size / 1024 / 1024)
+                check_csv_complete(path, quote)
 
                 rows = with_retries(
-                    lambda: load_csv(client, table, path, mode, quote, nl, width),
+                    lambda: load_csv(client, stage, path, mode, quote, nl, width),
                     f"загрузка {table}")
-                log.info("%s: загружено строк — %d", table, rows)
+                log.info("%s: в стадию загружено строк — %d", table, rows)
+                validate_staged(client, table, stage, rows)
 
                 if not check:
                     break
                 sql, minimum, label, strict = check
-                got = count(client, sql.format(table=f"{PROJECT}.{table}"))
+                got = count(client, sql.format(table=f"{PROJECT}.{stage}"))
                 log.info("%s: %s — %d", table, label, got)
                 if got >= minimum:
                     break
@@ -465,20 +576,18 @@ def main() -> int:
                     raise RuntimeError(
                         f"{table}: {label} {got} после {CONTENT_RETRIES} попыток, "
                         f"ожидалось не меньше {minimum} — источник пустой, "
-                        "пересборку не запускаю")
+                        "рабочая таблица не тронута")
                 else:
                     log.warning("%s: %s %d после %d попыток — колонка в источнике "
                                 "пустая. Это запасной источник, продолжаю без него.",
                                 table, label, got, CONTENT_RETRIES)
 
-            minimum = MIN_ROWS.get(table, 100)
-            if rows < minimum:
-                raise RuntimeError(
-                    f"{table}: строк {rows}, ожидалось не меньше {minimum} — "
-                    "формат уехал, пересборку не запускаю")
+            promote(client, stage, table)
+            log.info("%s: рабочая таблица обновлена (%d строк)", table, rows)
 
         except Exception as exc:  # noqa: BLE001
             log.error("ИСТОЧНИК УПАЛ | %s | %s", table, one_line(exc))
+            drop_stage(client, stage_name(table))
             failed.append(table)
             errors[table] = one_line(exc)
 

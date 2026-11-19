@@ -1,63 +1,167 @@
-"""Проверка порядка и устойчивости ночного job на заглушках (без сети и BigQuery)."""
-import importlib.util, os, sys, types
+"""Ночной job на заглушках (без сети и BigQuery): порядок, устойчивость к сбою листа,
+загрузка через стадию с проверками (пустой, короткий, оборванный лист, заголовки)."""
+import importlib.util
+import os
 
-def load(monkey_fail=()):
+GOOD_CSV = "ASIN,x\nB000000001,1\nB000000002,2\n"
+
+
+def load(fail=(), csv_by_table=None, rows_by_table=None, prev_rows=None, header_ok=True):
     spec = importlib.util.spec_from_file_location(
         "refresh", os.path.join(os.path.dirname(__file__), "..", "refresh_job", "refresh.py"))
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
-    calls, sent, gold = [], [], []
+    ev = {"loaded": [], "copied": [], "dropped": [], "sent": [], "gold": [], "cur": None}
     m.time.sleep = lambda *_: None
     m.get_token = lambda: "t"
     m.resolve_gid = lambda doc, sheet, token: "1"
     m.with_retries = lambda fn, what, *a, **k: fn()
+
     def dl(doc, gid, path, token):
-        return 1
+        # текущую таблицу подскажет порядок вызовов: берём её из SOURCES по счётчику
+        table = m.SOURCES[ev["i"]][0]
+        ev["cur"] = table
+        ev["i"] += 1
+        data = (csv_by_table or {}).get(table, GOOD_CSV)
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(data)
+        return len(data)
+    ev["i"] = 0
     m.download_sheet = dl
-    def ld(client, table, path, mode, quote, nl, width):
-        calls.append(table)
-        if table in monkey_fail:
+
+    def ld(client, dest, path, mode, quote, nl, width):
+        if ev["cur"] in fail:
             raise RuntimeError("Sheets\nexport 400")
-        return 100000
+        ev["loaded"].append(dest)
+        return (rows_by_table or {}).get(ev["cur"], 100000)
     m.load_csv = ld
-    m.count = lambda client, sql: 10**7
+
+    def cnt(client, sql):
+        if "CAST(" in sql and "WHERE" in sql:       # проверка заголовков
+            return 1 if header_ok else 0
+        return 10**7
+    m.count = cnt
     m.save_history = lambda client, skip=None: None
-    m.notify = lambda text: sent.append(text)
-    class Q:
+    m.notify = lambda text: ev["sent"].append(text)
+
+    class Job:
         def result(self):
             return []
+
+    class T:
+        def __init__(self, n):
+            self.num_rows = n
+
     class C:
-        def __init__(self, *a, **k): pass
+        def __init__(self, *a, **k):
+            pass
+
         def query(self, sql, **k):
             if "sp_refresh_gold" in sql:
-                gold.append(1)
-            return Q()
+                ev["gold"].append(1)
+            return Job()
+
+        def get_table(self, name):
+            short = name.split(".", 1)[1]
+            for tbl, _ in ((s[0], 0) for s in m.SOURCES):
+                if tbl.split(".")[-1] == short:
+                    return T((prev_rows or {}).get(tbl, 100000))
+            return T(100000)
+
+        def copy_table(self, src, dst, **k):
+            ev["copied"].append(dst.split(".", 1)[0].split("reorder-497714")[0] + dst.split("reorder-497714.")[1])
+            return Job()
+
+        def delete_table(self, name, **k):
+            ev["dropped"].append(name.split(".", 1)[1])
     m.bigquery.Client = C
-    return m, calls, sent, gold
+    return m, ev
+
 
 def test_order_spr_last():
-    m, *_ = load()
+    m, _ = load()
     names = [s[0] for s in m.SOURCES]
     spr = names.index("mt.SPR_native")
     for t in names:
         if t.startswith(("mt.hopted", "mt.order", "mt.amazon_starting", "mt.sales")):
             assert names.index(t) < spr
 
-def test_all_ok():
-    m, calls, sent, gold = load()
-    assert m.main() == 0 and gold and not sent and len(calls) == len(m.SOURCES)
+
+def test_all_ok_loads_stage_then_copies():
+    m, ev = load()
+    assert m.main() == 0
+    n = len(m.SOURCES)
+    assert len(ev["copied"]) == n and ev["gold"] and not ev["sent"]
+    assert all(x.startswith("mt._stage_") for x in ev["loaded"])
+    assert len(ev["dropped"]) == n
+
 
 def test_spr_fails_others_continue_no_gold():
-    m, calls, sent, gold = load({"mt.SPR_native"})
+    m, ev = load(fail={"mt.SPR_native"})
     assert m.main() == 1
-    assert len(calls) == len(m.SOURCES)          # дошли до конца
-    assert not gold                               # пересборка пропущена
-    assert sent and "SPR_native" in sent[0] and "\n" not in sent[0].split("- ")[1].split(": ", 1)[1]
+    assert len(ev["copied"]) == len(m.SOURCES) - 1 and "mt.SPR_native" not in ev["copied"]
+    assert not ev["gold"]
+    assert ev["sent"] and "SPR_native" in ev["sent"][0]
+
 
 def test_hopted_fails_gold_still_runs_exit_1():
-    m, calls, sent, gold = load({"mt.hopted_us_native"})
-    assert m.main() == 1 and gold and sent
+    m, ev = load(fail={"mt.hopted_us_native"})
+    assert m.main() == 1 and ev["gold"] and ev["sent"]
+
+
+def test_empty_sheet_does_not_touch_working_table():
+    m, ev = load(csv_by_table={"mt.order_us_native": ""})
+    assert m.main() == 1
+    assert "mt.order_us_native" not in ev["copied"]
+    assert "пуст" in ev["sent"][0]
+
+
+def test_short_sheet_below_min_rows():
+    m, ev = load(rows_by_table={"mt.order_uk_native": 120})
+    assert m.main() == 1
+    assert "mt.order_uk_native" not in ev["copied"]
+    assert "ожидалось не меньше" in ev["sent"][0]
+
+
+def test_truncated_sheet_unclosed_quote():
+    cut = 'ASIN,x\nB000000001,"оборвано на середине поля'
+    m, ev = load(csv_by_table={"mt.hopted_ca_native": cut})
+    assert m.main() == 1
+    assert "mt.hopted_ca_native" not in ev["copied"]
+    assert "оборван" in ev["sent"][0]
+
+
+def test_truncated_sheet_last_row_cut():
+    cut = "a,b,c,d,e,f\n1,2,3,4,5,6\n1,2,3,4,5,6\n7"
+    m, ev = load(csv_by_table={"mt.hopted_de_native": cut})
+    assert m.main() == 1 and "hopted_de_native" not in ev["copied"]
+
+
+def test_sudden_shrink_vs_previous_table():
+    m, ev = load(rows_by_table={"mt.order_ca_native": 6000}, prev_rows={"mt.order_ca_native": 11292})
+    assert m.main() == 1
+    assert "mt.order_ca_native" not in ev["copied"]
+    assert "сжатие" in ev["sent"][0]
+
+
+def test_header_mismatch_keeps_working_table():
+    m, ev = load(header_ok=False)
+    assert m.main() == 1
+    checked = set(m.HEADER_CHECKS)
+    # таблицы с проверкой заголовков не скопированы, три листа продаж без неё — скопированы
+    for t in checked:
+        assert t not in ev["copied"]
+    assert {"mt.sales_us_fact_native", "mt.sales_oos_amz_native", "mt.sales_plus_oos_native"} <= set(ev["copied"])
+
+
+def test_check_csv_complete_ok_and_no_quote_mode():
+    m, _ = load()
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, encoding="utf-8", newline="") as f:
+        f.write('a,"b\nc,d\n')          # непарная кавычка допустима в режиме без кавычек
+    assert m.check_csv_complete(f.name, "") == 2
+
 
 def test_one_line():
-    m, *_ = load()
+    m, _ = load()
     assert "\n" not in m.one_line(RuntimeError("a\nb"))
