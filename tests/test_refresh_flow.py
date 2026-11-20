@@ -6,7 +6,8 @@ import os
 GOOD_CSV = "ASIN,x\nB000000001,1\nB000000002,2\n"
 
 
-def load(fail=(), csv_by_table=None, rows_by_table=None, prev_rows=None, header_ok=True):
+def load(fail=(), csv_by_table=None, rows_by_table=None, prev_rows=None, header_ok=True,
+         asin_ok=None, silver_zero=None):
     spec = importlib.util.spec_from_file_location(
         "refresh", os.path.join(os.path.dirname(__file__), "..", "refresh_job", "refresh.py"))
     m = importlib.util.module_from_spec(spec)
@@ -39,6 +40,13 @@ def load(fail=(), csv_by_table=None, rows_by_table=None, prev_rows=None, header_
     def cnt(client, sql):
         if "CAST(" in sql and "WHERE" in sql:       # проверка заголовков
             return 1 if header_ok else 0
+        if "REGEXP_CONTAINS" in sql:                 # настоящие ASIN в ключевой колонке
+            for t, v in (asin_ok or {}).items():
+                if t.split(".")[-1] in sql:
+                    return v
+            return 10**7
+        if silver_zero and silver_zero in sql:
+            return 0
         return 10**7
     m.count = cnt
     m.save_history = lambda client, skip=None: None
@@ -165,3 +173,35 @@ def test_check_csv_complete_ok_and_no_quote_mode():
 def test_one_line():
     m, _ = load()
     assert "\n" not in m.one_line(RuntimeError("a\nb"))
+
+
+def test_sales_key_column_empty_fails_fast_and_names_cause():
+    m, ev = load(asin_ok={"mt.sales_oos_amz_native": 0})
+    assert m.main() == 1
+    assert "mt.sales_oos_amz_native" not in ev["copied"]
+    assert "mt.sales_us_fact_native" in ev["copied"] and "mt.order_us_native" in ev["copied"]
+    assert not ev["gold"]
+    first = ev["sent"][0]            # сообщение сразу при сбое, не в конце запуска
+    assert "mt.sales_oos_amz_native" in first and "string_field_0" in first
+    assert "пустая" in first and "ASIN" in first
+
+
+def test_silver_check_names_table_and_source():
+    import pytest
+    m, ev = load(silver_zero="oos_monthly")
+    with pytest.raises(RuntimeError) as e:
+        m.main()
+    msg = str(e.value)
+    assert "forecast.oos_monthly" in msg and "mt.sales_oos_amz_native" in msg
+    assert "неполным" not in msg
+
+
+def test_telegram_optional(monkeypatch):
+    m, ev = load()
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    import importlib
+    spec = importlib.util.spec_from_file_location(
+        "refresh2", os.path.join(os.path.dirname(__file__), "..", "refresh_job", "refresh.py"))
+    r = importlib.util.module_from_spec(spec); spec.loader.exec_module(r)
+    r.notify("тест")      # без секретов только предупреждение в лог, без исключения

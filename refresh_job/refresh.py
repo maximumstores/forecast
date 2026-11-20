@@ -150,6 +150,16 @@ HEADER_CHECKS = {
     "mt.ishodnik_native": [("col_A", "ASIN"), ("col_B", "Old ASIN"), ("col_C", "Category+parent")],
 }
 
+# Ключевая колонка с ASIN в листах продаж. В них нет строки заголовка с ASIN
+# (там #REF!), поэтому проверяем сами значения: доля строк с настоящим ASIN
+# (10 символов A-Z, 0-9). Пустая колонка = в таблице сломаны формулы.
+KEY_COLUMNS = {
+    "mt.sales_us_fact_native": ("string_field_0", "ASIN"),
+    "mt.sales_oos_amz_native": ("string_field_0", "ASIN"),
+    "mt.sales_plus_oos_native": ("string_field_0", "ASIN"),
+}
+KEY_MIN_SHARE = 0.5     # в рабочих таблицах сейчас ~95% строк с ASIN
+
 # Новая выгрузка не может быть короче прежней таблицы больше чем на эту долю:
 # так отсекается лист, который отдали обрезанным, но с числом строк выше порога.
 SHRINK_LIMIT = 0.30
@@ -321,6 +331,51 @@ def previous_rows(client: bigquery.Client, table: str) -> int | None:
         return None
 
 
+def asin_stats(client: bigquery.Client, table_ref: str, col: str) -> tuple[int, int]:
+    """(строк всего, строк с настоящим ASIN в колонке col)."""
+    total = count(client, f"SELECT COUNT(*) FROM `{PROJECT}.{table_ref}`")
+    ok = count(client,
+               f"SELECT COUNTIF(REGEXP_CONTAINS(TRIM({col}), r'^[A-Z0-9]{{10}}$')) "
+               f"FROM `{PROJECT}.{table_ref}`")
+    return total, ok
+
+
+def ref_columns(client: bigquery.Client, table_ref: str) -> str:
+    """Номера колонок (с нуля), где в ячейках есть #REF!: так видно, какие формулы сломаны.
+    Любая ошибка диагностики не должна скрывать основную причину."""
+    try:
+        names = [f.name for f in client.get_table(f"{PROJECT}.{table_ref}").schema]
+        expr = ", ".join(f"COUNTIF(CAST({n} AS STRING) = '#REF!') AS c{i}"
+                         for i, n in enumerate(names))
+        row = list(client.query(f"SELECT {expr} FROM `{PROJECT}.{table_ref}`",
+                                location=LOCATION).result())[0]
+        return ",".join(str(i) for i in range(len(names)) if row[i])
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def key_column_message(client: bigquery.Client, table: str, table_ref: str,
+                       col: str, label: str, total: int, ok: int) -> str:
+    refs = ref_columns(client, table_ref)
+    msg = (f"{table}: колонка {label} ({col}) пустая: настоящих значений {ok} из {total} строк")
+    if refs:
+        msg += f"; #REF! в колонках {refs} (номера с нуля) — в таблице сломаны формулы"
+    return msg
+
+
+def check_key_column(client: bigquery.Client, table: str, stage: str) -> None:
+    """Сразу после загрузки листа: в ключевой колонке есть настоящие ASIN.
+    Иначе рабочая таблица не перезаписывается, причина названа конкретно."""
+    key = KEY_COLUMNS.get(table)
+    if not key:
+        return
+    col, label = key
+    total, ok = asin_stats(client, stage, col)
+    if total == 0 or ok < total * KEY_MIN_SHARE:
+        raise RuntimeError(key_column_message(client, table, stage, col, label, total, ok)
+                           + " — рабочая таблица не тронута")
+
+
 def validate_staged(client: bigquery.Client, table: str, stage: str, rows: int) -> None:
     """Проверки загруженного в стадию: число строк, сжатие против прежней таблицы,
     заголовки. Любая ошибка — рабочая таблица остаётся как была."""
@@ -333,6 +388,7 @@ def validate_staged(client: bigquery.Client, table: str, stage: str, rows: int) 
         raise RuntimeError(f"строк {rows} против {prev} в рабочей таблице: "
                            f"сжатие больше {SHRINK_LIMIT:.0%}, похоже на обрезанный лист")
     check_header(client, table, stage)
+    check_key_column(client, table, stage)
 
 
 def promote(client: bigquery.Client, stage: str, table: str) -> None:
@@ -590,6 +646,11 @@ def main() -> int:
             drop_stage(client, stage_name(table))
             failed.append(table)
             errors[table] = one_line(exc)
+            if table in GOLD_REQUIRES:
+                # пересборка из-за этого не состоится, сообщаем сразу, а не в конце запуска;
+                # остальные листы (сток, заказы, Hopted) продолжают грузиться
+                notify(f"Ночное обновление forecast: источник упал, пересборка не состоится.\n"
+                       f"- {table}: {errors[table]}")
 
         if i < len(SOURCES) - 1:
             log.info("пауза %d с перед следующим листом", PAUSE_BETWEEN)
@@ -612,29 +673,39 @@ def main() -> int:
         return 1
 
     # ---------------------------------------------- проверки silver-слоя
+    # (название, запрос, минимум, таблица-источник, колонка ASIN в ней для диагностики)
     checks = [
-        ("строк в fact_sales_monthly",
-         f"SELECT COUNT(*) FROM `{PROJECT}.forecast.fact_sales_monthly`", 100000),
-        ("строк в oos_monthly",
-         f"SELECT COUNT(*) FROM `{PROJECT}.forecast.oos_monthly`", 100000),
-        ("строк в dim_product",
-         f"SELECT COUNT(*) FROM `{PROJECT}.forecast.dim_product`", 5000),
-        ("строк в group_demand_monthly",
-         f"SELECT COUNT(*) FROM `{PROJECT}.forecast.group_demand_monthly`", 1000),
+        ("forecast.fact_sales_monthly",
+         f"SELECT COUNT(*) FROM `{PROJECT}.forecast.fact_sales_monthly`", 100000,
+         "mt.sales_us_fact_native"),
+        ("forecast.oos_monthly",
+         f"SELECT COUNT(*) FROM `{PROJECT}.forecast.oos_monthly`", 100000,
+         "mt.sales_oos_amz_native"),
+        ("forecast.dim_product",
+         f"SELECT COUNT(*) FROM `{PROJECT}.forecast.dim_product`", 5000, "mt.SPR_native"),
+        ("forecast.group_demand_monthly",
+         f"SELECT COUNT(*) FROM `{PROJECT}.forecast.group_demand_monthly`", 1000, None),
         # свежесть стока: если источник приехал пустым или колонка слетела,
         # план посчитается без остатка — такого не пропускаем
-        ("ASIN с остатком в stock_current",
-         f"SELECT COUNTIF(stock_us > 0) FROM `{PROJECT}.forecast.stock_current`", 1000),
-        ("строк в legacy_incoming",
-         f"SELECT COUNT(*) FROM `{PROJECT}.forecast.legacy_incoming`", 1000),
+        ("forecast.stock_current (ASIN с остатком)",
+         f"SELECT COUNTIF(stock_us > 0) FROM `{PROJECT}.forecast.stock_current`", 1000,
+         "mt.amazon_starting_balance_native"),
+        ("forecast.legacy_incoming",
+         f"SELECT COUNT(*) FROM `{PROJECT}.forecast.legacy_incoming`", 1000,
+         "mt.ishodnik_native"),
     ]
-    for label, sql, minimum in checks:
+    for label, sql, minimum, src in checks:
         n = count(client, sql)
         log.info("%s: %d", label, n)
         if n < minimum:
-            raise RuntimeError(
-                f"{label}: {n}, ожидалось не меньше {minimum} — "
-                "источник пришёл неполным, пересборку не запускаю")
+            detail = ""
+            if src in KEY_COLUMNS:
+                col, key_label = KEY_COLUMNS[src]
+                total, ok = asin_stats(client, src, col)
+                detail = " | " + key_column_message(client, src, src, col, key_label, total, ok)
+            elif src:
+                detail = f" | проверь источник {src}"
+            raise RuntimeError(f"{label}: строк {n}, ожидалось не меньше {minimum}{detail}")
 
     log.info("Запускаю sp_refresh_gold — это несколько минут")
     client.query(f"CALL `{PROJECT}.forecast.sp_refresh_gold`()",
