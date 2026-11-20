@@ -58,7 +58,6 @@ SHEET_HOPTED = "16AjBg-FziOJj7qE34y9KACWMPLjiHUv3B0BDebgaI4Q"   # сюда пи�
 SOURCES = [
     # table,                          doc,                sheet,                          mode,     quote, nl,    width
     ("mt.sales_us_fact_native",       SHEET_SALES,        "2127822292",                   "auto",   '"',   True, None),
-    ("mt.sales_oos_amz_native",       SHEET_SALES,        "404969167",                    "auto",   "",    False, None),
     ("mt.sales_plus_oos_native",      SHEET_SALES,        "1547531617",                   "auto",   "",    False, None),
     # сток на руках и себестоимость — диапазон A:AM (39 колонок)
     ("mt.amazon_starting_balance_native", SHEET_ORDERS_STOCK,
@@ -89,7 +88,7 @@ SOURCES = [
 # Пересборку forecast.* запускаем только если обновились эти источники:
 # без продаж, стартового остатка и справочника план посчитается на старых данных.
 GOLD_REQUIRES = {
-    "mt.sales_us_fact_native", "mt.sales_oos_amz_native", "mt.sales_plus_oos_native",
+    "mt.sales_us_fact_native", "mt.sales_plus_oos_native",
     "mt.amazon_starting_balance_native", "mt.SPR_native",
 }
 
@@ -155,7 +154,6 @@ HEADER_CHECKS = {
 # (10 символов A-Z, 0-9). Пустая колонка = в таблице сломаны формулы.
 KEY_COLUMNS = {
     "mt.sales_us_fact_native": ("string_field_0", "ASIN"),
-    "mt.sales_oos_amz_native": ("string_field_0", "ASIN"),
     "mt.sales_plus_oos_native": ("string_field_0", "ASIN"),
 }
 KEY_MIN_SHARE = 0.5     # в рабочих таблицах сейчас ~95% строк с ASIN
@@ -168,7 +166,6 @@ STAGE_PREFIX = "_stage_"
 # ожидаемое число строк — если после загрузки сильно меньше, значит формат уехал
 MIN_ROWS = {
     "mt.sales_us_fact_native": 5000,
-    "mt.sales_oos_amz_native": 5000,
     "mt.sales_plus_oos_native": 5000,
     "mt.SPR_native": 5000,
     "mt.amazon_starting_balance_native": 5000,
@@ -531,6 +528,72 @@ def save_history(client: bigquery.Client, skip: set[str] | None = None) -> None:
                         "похоже, Hopted перестал обновлять лист", src_name)
 
 
+# ------------------------------------------------------------------ источники OOS
+# Дни аута с ноября 2026 считаются из леджера DataDoe (datadoe_copy.fba_ledger_summary),
+# для ASIN вне леджера — из ежедневных срезов Hopted US (mt.stock_history, hopted_us_native).
+# Срезы Hopted — обязательный источник: пропущенный день нельзя восстановить задним числом.
+HOPTED_GAP_DAYS = int(os.environ.get("HOPTED_GAP_DAYS", "3"))      # смотрим сегодня и два дня назад
+LEDGER_MAX_LAG_DAYS = int(os.environ.get("LEDGER_MAX_LAG_DAYS", "8"))  # обычная задержка леджера 4–6 дней
+
+
+def check_hopted_days(client: bigquery.Client) -> list[str]:
+    """Даты последних HOPTED_GAP_DAYS дней (с первого среза), за которые нет среза Hopted US."""
+    rows = client.query(
+        f"""
+        WITH have AS (
+          SELECT DISTINCT snapshot_date AS d FROM `{PROJECT}.mt.stock_history`
+          WHERE source = 'hopted_us_native'),
+        first_day AS (SELECT MIN(d) AS d0 FROM have)
+        SELECT CAST(d AS STRING) AS d
+        FROM UNNEST(GENERATE_DATE_ARRAY(
+               DATE_SUB(CURRENT_DATE('Europe/Kyiv'), INTERVAL {HOPTED_GAP_DAYS - 1} DAY),
+               CURRENT_DATE('Europe/Kyiv'))) AS d
+        WHERE d NOT IN (SELECT d FROM have) AND d >= (SELECT d0 FROM first_day)
+        ORDER BY d
+        """,
+        location=LOCATION,
+    ).result()
+    return [r.d for r in rows]
+
+
+def ledger_lag_days(client: bigquery.Client) -> int | None:
+    """Сколько дней назад последняя дата в леджере DataDoe (None — таблица пуста)."""
+    rows = list(client.query(
+        f"""
+        SELECT DATE_DIFF(CURRENT_DATE('Europe/Kyiv'), MAX(date), DAY) AS lag
+        FROM `{PROJECT}.datadoe_copy.fba_ledger_summary`
+        """,
+        location=LOCATION,
+    ).result())
+    return rows[0].lag if rows else None
+
+
+def check_oos_inputs(client: bigquery.Client) -> list[str]:
+    """Проверка источников OOS. Каждая проблема — ERROR в журнале и сообщение в Telegram,
+    пересборку не останавливает, но запуск завершается с ошибкой."""
+    problems: list[str] = []
+    try:
+        missing = check_hopted_days(client)
+        if missing:
+            problems.append("нет среза Hopted US за " + ", ".join(missing))
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"срезы Hopted не проверить: {one_line(exc)}")
+    try:
+        lag = ledger_lag_days(client)
+        if lag is None:
+            problems.append("леджер DataDoe пуст")
+        elif lag > LEDGER_MAX_LAG_DAYS:
+            problems.append(f"леджер DataDoe отстаёт на {lag} дн. (норма до {LEDGER_MAX_LAG_DAYS})")
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"леджер DataDoe не проверить: {one_line(exc)}")
+    for p in problems:
+        log.error("OOS ИСТОЧНИК | %s", p)
+    if problems:
+        notify("Ночное обновление forecast: проблема с источниками OOS.\n"
+               + "\n".join(f"- {p}" for p in problems))
+    return problems
+
+
 # ------------------------------------------------------------------ уведомления
 def one_line(exc: object, limit: int = 300) -> str:
     """Причина сбоя одной строкой: тип и текст без переносов."""
@@ -663,6 +726,9 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         log.warning("срез истории не сохранился: %s", exc)
 
+    # ---------------------------------------------- источники OOS (Hopted и леджер)
+    oos_problems = check_oos_inputs(client)
+
     # ---------------------------------------------- пересобирать ли forecast.*
     blocked = sorted(set(failed) & GOLD_REQUIRES)
     if blocked:
@@ -680,7 +746,7 @@ def main() -> int:
          "mt.sales_us_fact_native"),
         ("forecast.oos_monthly",
          f"SELECT COUNT(*) FROM `{PROJECT}.forecast.oos_monthly`", 100000,
-         "mt.sales_oos_amz_native"),
+         "forecast.oos_source_report"),
         ("forecast.dim_product",
          f"SELECT COUNT(*) FROM `{PROJECT}.forecast.dim_product`", 5000, "mt.SPR_native"),
         ("forecast.group_demand_monthly",
@@ -704,7 +770,7 @@ def main() -> int:
                 total, ok = asin_stats(client, src, col)
                 detail = " | " + key_column_message(client, src, src, col, key_label, total, ok)
             elif src:
-                detail = f" | проверь источник {src}"
+                detail = f" | проверь {src}"
             raise RuntimeError(f"{label}: строк {n}, ожидалось не меньше {minimum}{detail}")
 
     log.info("Запускаю sp_refresh_gold — это несколько минут")
@@ -725,6 +791,9 @@ def main() -> int:
         log.error("Готово, но не обновились: %s. Данные из этих листов старые.", ", ".join(failed))
         notify("Ночное обновление forecast завершено с ошибкой.\n"
                + "\n".join(f"- {t}: {errors.get(t, '?')}" for t in failed))
+        return 1
+    if oos_problems:
+        log.error("Готово, но есть проблемы с источниками OOS: %s", "; ".join(oos_problems))
         return 1
     log.info("Готово")
     return 0

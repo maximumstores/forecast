@@ -34,15 +34,33 @@ Telegram необязателен. Без секретов job пишет в л�
 ## Проверка свежести (отдельный запуск того же образа)
     gcloud run jobs create forecast-refresh-fresh --image "$IMAGE" --region europe-north1 \
       --command python --args refresh.py,--check-fresh --task-timeout 600 --max-retries 0
-    gcloud scheduler jobs create http forecast-refresh-fresh-0430 --schedule "30 4 * * *" \
-      --time-zone UTC --uri https://europe-north1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/reorder-497714/jobs/forecast-refresh-fresh:run \
+    gcloud scheduler jobs create http forecast-refresh-fresh-0830 --schedule "30 8 * * *" \
+      --time-zone Europe/Kiev --uri https://europe-north1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/reorder-497714/jobs/forecast-refresh-fresh:run \
       --http-method POST --oauth-service-account-email streamlit-planner@reorder-497714.iam.gserviceaccount.com
 
-Проверка в 04:30 UTC смотрит, что каждая из ключевых таблиц обновлена не раньше 03:00 UTC того же дня.
+Проверка в 08:30 по Киеву смотрит, что каждая из ключевых таблиц обновлена не раньше 03:00 UTC того же дня.
 
 ## Если упало на проверке ключевой колонки
 Сообщение называет таблицу, колонку, число строк и колонки с #REF!. Это ошибка в самой
 таблице Google (сломаны формулы), чинит владелец файла. Рабочая таблица при этом не
 перезаписывается: после правки в листе следующий запуск подхватит данные сам.
-Внимание: `mt.sales_oos_amz_native` на 20.11 уже содержит сломанную выгрузку (старый код
-писал напрямую), пока лист не починят, `forecast.oos_monthly` пустой.
+## OOS из леджера DataDoe (с ноября 2026)
+Вкладка «OOS amazon» больше не загружается, `mt.sales_oos_amz_native` не читается расчётом
+(таблица остаётся как архив). `forecast.oos_monthly` собирается из:
+- копии листа от 17.11 (`forecast.oos_sheet_snapshot_1117`, неизменяемая) — месяцы до границы;
+- леджера DataDoe (`datadoe_copy.fba_ledger_summary`) — месяцы с границы;
+- ежедневных срезов Hopted US (`mt.stock_history`, `oos_source = 'hopted'`) — ASIN, которых нет в леджере.
+
+Каждую ночь после загрузки задание проверяет и пишет ERROR в журнал и в Telegram (запуск
+завершается с ошибкой, пересборка при этом идёт): нет среза Hopted US за сегодня или два
+предыдущих дня; леджер пуст или отстаёт больше чем на 8 дней (`LEDGER_MAX_LAG_DAYS`).
+Пропущенный день Hopted не восстановить: он виден в `forecast.hopted_snapshot_gaps`.
+Доля единиц по источникам — `forecast.oos_source_report`.
+
+Создание представлений (один раз, после «ок» на сверку): `python tools/oos_sql.py --ds forecast --cutover 2026-11-01`
+и выполнить полученный SQL по файлам по порядку (10→50). Для проверки на копии: `--ds forecast_shadow --cutover 2026-09-01`.
+
+## Расписание после перехода
+Запуск задания: 06:30 Киев (DataDoe приходит в 05:30–06:00). Проверку свежести сдвинуть на 08:30 Киев,
+иначе она сработает до окончания загрузки. `FRESH_SINCE_UTC` оставить 03:00 (старт 06:30 Киев — это
+03:30–04:30 UTC в зависимости от сезона).

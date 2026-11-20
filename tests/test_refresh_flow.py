@@ -7,7 +7,7 @@ GOOD_CSV = "ASIN,x\nB000000001,1\nB000000002,2\n"
 
 
 def load(fail=(), csv_by_table=None, rows_by_table=None, prev_rows=None, header_ok=True,
-         asin_ok=None, silver_zero=None):
+         asin_ok=None, silver_zero=None, hopted_missing=(), ledger_lag=5):
     spec = importlib.util.spec_from_file_location(
         "refresh", os.path.join(os.path.dirname(__file__), "..", "refresh_job", "refresh.py"))
     m = importlib.util.module_from_spec(spec)
@@ -50,6 +50,8 @@ def load(fail=(), csv_by_table=None, rows_by_table=None, prev_rows=None, header_
         return 10**7
     m.count = cnt
     m.save_history = lambda client, skip=None: None
+    m.check_hopted_days = lambda client: list(hopted_missing)
+    m.ledger_lag_days = lambda client: ledger_lag
     m.notify = lambda text: ev["sent"].append(text)
 
     class Job:
@@ -159,7 +161,7 @@ def test_header_mismatch_keeps_working_table():
     # таблицы с проверкой заголовков не скопированы, три листа продаж без неё — скопированы
     for t in checked:
         assert t not in ev["copied"]
-    assert {"mt.sales_us_fact_native", "mt.sales_oos_amz_native", "mt.sales_plus_oos_native"} <= set(ev["copied"])
+    assert {"mt.sales_us_fact_native", "mt.sales_plus_oos_native"} <= set(ev["copied"])
 
 
 def test_check_csv_complete_ok_and_no_quote_mode():
@@ -176,13 +178,13 @@ def test_one_line():
 
 
 def test_sales_key_column_empty_fails_fast_and_names_cause():
-    m, ev = load(asin_ok={"mt.sales_oos_amz_native": 0})
+    m, ev = load(asin_ok={"mt.sales_us_fact_native": 0})
     assert m.main() == 1
-    assert "mt.sales_oos_amz_native" not in ev["copied"]
-    assert "mt.sales_us_fact_native" in ev["copied"] and "mt.order_us_native" in ev["copied"]
+    assert "mt.sales_us_fact_native" not in ev["copied"]
+    assert "mt.sales_plus_oos_native" in ev["copied"] and "mt.order_us_native" in ev["copied"]
     assert not ev["gold"]
     first = ev["sent"][0]            # сообщение сразу при сбое, не в конце запуска
-    assert "mt.sales_oos_amz_native" in first and "string_field_0" in first
+    assert "mt.sales_us_fact_native" in first and "string_field_0" in first
     assert "пустая" in first and "ASIN" in first
 
 
@@ -192,7 +194,7 @@ def test_silver_check_names_table_and_source():
     with pytest.raises(RuntimeError) as e:
         m.main()
     msg = str(e.value)
-    assert "forecast.oos_monthly" in msg and "mt.sales_oos_amz_native" in msg
+    assert "forecast.oos_monthly" in msg and "forecast.oos_source_report" in msg
     assert "неполным" not in msg
 
 
@@ -205,3 +207,36 @@ def test_telegram_optional(monkeypatch):
         "refresh2", os.path.join(os.path.dirname(__file__), "..", "refresh_job", "refresh.py"))
     r = importlib.util.module_from_spec(spec); spec.loader.exec_module(r)
     r.notify("тест")      # без секретов только предупреждение в лог, без исключения
+
+
+def test_oos_tab_no_longer_loaded_or_required():
+    m, ev = load()
+    names = [s[0] for s in m.SOURCES]
+    assert "mt.sales_oos_amz_native" not in names
+    assert "mt.sales_oos_amz_native" not in m.GOLD_REQUIRES
+    assert "mt.sales_oos_amz_native" not in m.MIN_ROWS and "mt.sales_oos_amz_native" not in m.KEY_COLUMNS
+    assert m.main() == 0 and ev["gold"]
+
+
+def test_missing_hopted_day_is_loud_but_rebuild_runs():
+    m, ev = load(hopted_missing=["2026-11-21"])
+    assert m.main() == 1
+    assert ev["gold"]                                   # пересборка идёт
+    assert any("2026-11-21" in t and "Hopted" in t for t in ev["sent"])
+
+
+def test_ledger_stale_is_loud():
+    m, ev = load(ledger_lag=12)
+    assert m.main() == 1 and ev["gold"]
+    assert any("DataDoe" in t and "12" in t for t in ev["sent"])
+
+
+def test_ledger_empty_is_loud():
+    m, ev = load(ledger_lag=None)
+    assert m.main() == 1
+    assert any("пуст" in t for t in ev["sent"])
+
+
+def test_oos_checks_ok_exit_0_no_messages():
+    m, ev = load(hopted_missing=(), ledger_lag=6)
+    assert m.main() == 0 and not ev["sent"]
