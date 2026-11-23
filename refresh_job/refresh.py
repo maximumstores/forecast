@@ -594,6 +594,30 @@ def check_oos_inputs(client: bigquery.Client) -> list[str]:
     return problems
 
 
+# Снимки fba_inventory_health (datadoe_copy, копится хабом в *_history): загрузка в 05:30 Киев кладёт
+# состояние на конец вчерашнего дня с датой «вчера». Для OOS по дням нужны все три US-магазина.
+HEALTH_US_STORES = [x.strip() for x in os.environ.get(
+    "HEALTH_US_STORES", "MR EQUIPP US,SPORTACUS US,World Sports Fanatics US").split(",") if x.strip()]
+
+
+def check_health_inputs(client: bigquery.Client) -> list[str]:
+    """US-магазины, по которым нет снимка health за вчера (дата снимка = вчера по Киеву)."""
+    cfg = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ArrayQueryParameter("stores", "STRING", HEALTH_US_STORES)])
+    rows = client.query(
+        f"""
+        SELECT s AS store FROM UNNEST(@stores) AS s
+        WHERE s NOT IN (
+          SELECT DISTINCT seller_or_vendor_name
+          FROM `{PROJECT}.datadoe_copy.fba_inventory_health_history`
+          WHERE date = DATE_SUB(CURRENT_DATE('Europe/Kyiv'), INTERVAL 1 DAY))
+        ORDER BY s
+        """,
+        job_config=cfg, location=LOCATION,
+    ).result()
+    return [r.store for r in rows]
+
+
 # ------------------------------------------------------------------ уведомления
 def one_line(exc: object, limit: int = 300) -> str:
     """Причина сбоя одной строкой: тип и текст без переносов."""
@@ -728,6 +752,18 @@ def main() -> int:
 
     # ---------------------------------------------- источники OOS (Hopted и леджер)
     oos_problems = check_oos_inputs(client)
+
+    # снимки health: нет вчерашнего дня по любому из трёх US-магазинов — прогноз не пересобираем
+    try:
+        health_missing = check_health_inputs(client)
+    except Exception as exc:  # noqa: BLE001
+        health_missing = [f"проверка не выполнилась: {one_line(exc)}"]
+    if health_missing:
+        log.error("ПЕРЕСБОРКА ПРОПУЩЕНА | нет снимка inventory_health за вчера: %s. "
+                  "forecast.* остаётся от прошлого запуска.", ", ".join(health_missing))
+        notify("Ночное обновление forecast: пересборка пропущена, нет снимка inventory_health за вчера.\n"
+               + "\n".join(f"- {x}" for x in health_missing))
+        return 1
 
     # ---------------------------------------------- пересобирать ли forecast.*
     blocked = sorted(set(failed) & GOLD_REQUIRES)
