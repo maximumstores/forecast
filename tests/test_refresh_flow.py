@@ -7,7 +7,7 @@ GOOD_CSV = "ASIN,x\nB000000001,1\nB000000002,2\n"
 
 
 def load(fail=(), csv_by_table=None, rows_by_table=None, prev_rows=None, header_ok=True,
-         asin_ok=None, silver_zero=None, hopted_missing=(), ledger_lag=5):
+         asin_ok=None, silver_zero=None, hopted_missing=(), ledger_lag=5, health_missing=()):
     spec = importlib.util.spec_from_file_location(
         "refresh", os.path.join(os.path.dirname(__file__), "..", "refresh_job", "refresh.py"))
     m = importlib.util.module_from_spec(spec)
@@ -52,6 +52,7 @@ def load(fail=(), csv_by_table=None, rows_by_table=None, prev_rows=None, header_
     m.save_history = lambda client, skip=None: None
     m.check_hopted_days = lambda client: list(hopted_missing)
     m.ledger_lag_days = lambda client: ledger_lag
+    m.check_health_inputs = lambda client: list(health_missing)
     m.notify = lambda text: ev["sent"].append(text)
 
     class Job:
@@ -240,3 +241,28 @@ def test_ledger_empty_is_loud():
 def test_oos_checks_ok_exit_0_no_messages():
     m, ev = load(hopted_missing=(), ledger_lag=6)
     assert m.main() == 0 and not ev["sent"]
+
+
+def test_health_missing_store_skips_rebuild_keeps_yesterday():
+    m, ev = load(health_missing=["SPORTACUS US"])
+    assert m.main() == 1
+    assert not ev["gold"]                               # вчерашний прогноз остаётся
+    assert any("SPORTACUS US" in x and "inventory_health" in x for x in ev["sent"])
+
+
+def test_health_check_error_also_skips_rebuild():
+    m, ev = load()
+    def boom(client):
+        raise RuntimeError("bq down")
+    m.check_health_inputs = boom
+    assert m.main() == 1 and not ev["gold"]
+
+
+def test_health_ok_rebuild_runs():
+    m, ev = load(health_missing=())
+    assert m.main() == 0 and ev["gold"]
+
+
+def test_health_stores_default_three_us():
+    m, _ = load()
+    assert m.HEALTH_US_STORES == ["MR EQUIPP US", "SPORTACUS US", "World Sports Fanatics US"]
